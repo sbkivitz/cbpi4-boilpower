@@ -59,12 +59,6 @@ except ImportError:  # pragma: no cover - depends on the host installation
 
     clock = _RealClock()
 
-try:
-    # Same reasoning as the clock import: only forks carry this, and a plugin
-    # that cannot load is worse than one without dry-fire protection.
-    from cbpi.api.dryfire import DryFireWatch
-except ImportError:  # pragma: no cover - depends on the host installation
-    DryFireWatch = None
 
 
 @parameters([
@@ -83,18 +77,15 @@ except ImportError:  # pragma: no cover - depends on the host installation
         label="SampleTime", options=[2, 5],
         description="Seconds between control decisions. Matches PIDBoil."),
     Property.Number(
-        label="Volume_Litres", configurable=True, default_value=0,
-        description="Litres in the vessel. With Element_Watts, enables dry-fire "
-                    "protection. 0 disables."),
-    Property.Number(
-        label="Element_Watts", configurable=True, default_value=0,
-        description="Element rating in watts. With Volume_Litres, enables "
-                    "dry-fire protection. 0 disables."),
+        label="Stall_Minutes", configurable=True, default_value=10,
+        description="Cut the element if it is heating below the threshold and "
+                    "the temperature has not risen for this long. Catches a dry "
+                    "vessel, a probe out of the liquid, and a dead element. "
+                    "0 disables."),
     Property.Number(
         label="Max_Safe_Temp", configurable=True, default_value=0,
-        description="Cut the element if the vessel exceeds this. A boil kettle "
-                    "above boiling has already lost its liquid. 0 uses "
-                    "Boil_Threshold + 15 degrees."),
+        description="Cut the element above this temperature. 0 uses boiling "
+                    "plus 10 degrees, which liquid cannot reach."),
 ])
 class BoilPower(CBPiKettleLogic):
     """Ramp at full power, then hold a chosen duty."""
@@ -188,6 +179,28 @@ class BoilPower(CBPiKettleLogic):
         except (TypeError, ValueError, AttributeError):
             pass
         return configured
+
+    # A vessel this far above boiling is dry, whatever the setpoint says.
+    #
+    # The default used to be Boil_Threshold + 15C, which is wrong in a way that
+    # would ruin a brew day: it trips whenever the kettle legitimately runs
+    # hotter than its own threshold. Set a 77C/170F hop stand and then bring
+    # the same kettle to a boil and the guard fires on a perfectly healthy
+    # boil, killing the element and stopping the logic.
+    #
+    # Water cannot exceed its boiling point by any margin while there is water
+    # in it - the energy goes into vapour, not temperature - so a reading well
+    # above boiling means there is nothing left to boil. That is an absolute
+    # fact about the vessel, independent of what the brewer asked for, which is
+    # what a last-resort guard should be keyed on.
+    DRY_ABOVE_BOILING_C = 10.0
+    BOILING_C = 100.0
+
+    def _default_max_safe(self):
+        ceiling_c = self.BOILING_C + self.DRY_ABOVE_BOILING_C
+        if self._unit() == "C":
+            return ceiling_c
+        return ceiling_c * 9.0 / 5.0 + 32.0
 
     def _read_temp(self, sensor_id):
         """Current temperature, or None if it cannot be trusted.
@@ -293,18 +306,30 @@ class BoilPower(CBPiKettleLogic):
             # new instance; lose it on a genuine restart.
             self._boil_power_override = getattr(self, "_boil_power_override", None)
 
-            # Dry-fire protection. Needs two facts no kettle carries - how much
-            # liquid is in it and how big the element is - so it does nothing
-            # until both are configured.
-            #
-            # This plugin shipped without it, and a simulated 40 L kettle left
-            # boiling at 85% ran itself dry and climbed to 404 F with the
-            # element still commanded on and nothing said to the brewer. On a
-            # real rig that is a destroyed element at best.
-            dry_watch = DryFireWatch() if DryFireWatch else None
-            dry_litres = max(0.0, float(self.props.get("Volume_Litres", 0) or 0))
-            dry_watts = max(0.0, float(self.props.get("Element_Watts", 0) or 0))
             degree_ratio = 1.0 if self._unit() == "C" else 1.8
+
+            # A stall is the real signal that a vessel is dry.
+            #
+            # A rate-of-rise check was tried first and removed: in a genuinely
+            # dry kettle the probe sits in air, which couples to a thermowell
+            # badly, so the reading barely moves while the element glows and
+            # destroys itself. A detector looking for "rising faster than
+            # physics allows" therefore has no true positives for the thing it
+            # was built for, and only false ones - it tripped a healthy boil on
+            # this rig. Worse than nothing, because it stops a brew day and
+            # buys no safety.
+            #
+            # The inverse is what actually shows: the element commanded and
+            # nothing happening. That catches a dry vessel, a probe lifted out
+            # of the liquid, and a dead element, with one check.
+            #
+            # Only while heating TOWARDS the threshold. Once boiling, a flat
+            # temperature is exactly correct - the energy is going into vapour
+            # - so a stall watch that ran during the boil would fire on every
+            # successful one.
+            stall_limit = max(0.0, float(self.props.get("Stall_Minutes", 10) or 0)) * 60
+            stall_anchor_temp = None
+            stall_anchor_at = None
 
             # A second, cruder guard that needs nothing configured.
             #
@@ -350,7 +375,7 @@ class BoilPower(CBPiKettleLogic):
                 # Fresh every pass, so moving the setpoint acts on a running
                 # boil instead of waiting for a restart.
                 threshold = self._threshold()
-                max_safe = configured_max_safe or (threshold + (15.0 * degree_ratio))
+                max_safe = configured_max_safe or self._default_max_safe()
 
                 if current_temp is None:
                     # No trustworthy reading. Heating blind toward a boil is the
@@ -389,24 +414,36 @@ class BoilPower(CBPiKettleLogic):
                     self.running = False
                     break
 
-                if dry_watch is not None and dry_watch.note(
-                    current_temp, dry_watts, dry_litres, degree_ratio
-                ):
-                    await self.actor_off(self.heater)
-                    heater_is_on = False
-                    heat_percent_old = 0
-                    try:
-                        self.cbpi.notify(
-                            "Dry fire",
-                            dry_watch.describe(
-                                getattr(self.kettle, "name", "Kettle"), dry_litres
-                            ),
-                            NotificationType.ERROR,
-                        )
-                    except Exception:  # noqa: BLE001
-                        pass
-                    self.running = False
-                    break
+                # Heating towards the threshold and getting nowhere.
+                if (stall_limit > 0 and heater_is_on and not boil_latched
+                        and current_temp < threshold):
+                    if (stall_anchor_temp is None
+                            or current_temp > stall_anchor_temp + 0.5):
+                        stall_anchor_temp = current_temp
+                        stall_anchor_at = clock.now()
+                    elif clock.now() - stall_anchor_at >= stall_limit:
+                        await self.actor_off(self.heater)
+                        heater_is_on = False
+                        heat_percent_old = 0
+                        try:
+                            self.cbpi.notify(
+                                "Heating stalled",
+                                "'{}' has been heating for {:.0f} minutes "
+                                "without rising - it stopped at {:.1f}. An "
+                                "empty vessel, a probe out of the liquid or a "
+                                "dead element all look like this. The element "
+                                "has been switched off.".format(
+                                    getattr(self.kettle, "name", "Kettle"),
+                                    stall_limit / 60.0, current_temp),
+                                NotificationType.ERROR,
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                        self.running = False
+                        break
+                else:
+                    stall_anchor_temp = None
+                    stall_anchor_at = None
 
                 if current_temp >= threshold:
                     boil_latched = True
