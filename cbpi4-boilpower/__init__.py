@@ -307,10 +307,13 @@ class BoilPower(CBPiKettleLogic):
                     # No trustworthy reading. Heating blind toward a boil is the
                     # one thing not to do, so the element comes off until a real
                     # measurement returns.
-                    if heater_is_on:
-                        await self.actor_off(self.heater)
-                        heater_is_on = False
-                        heat_percent_old = 0
+                    #
+                    # Unconditional: commanding off something already off costs
+                    # one redundant call, while not commanding off something
+                    # that IS on is how an element stays live.
+                    await self.actor_off(self.heater)
+                    heater_is_on = False
+                    heat_percent_old = 0
                     await clock.sleep(sample_time)
                     continue
 
@@ -319,10 +322,9 @@ class BoilPower(CBPiKettleLogic):
                 # dry-fire check below, so it catches the accident on a rig
                 # where nobody filled in the volume and wattage.
                 if current_temp >= max_safe:
-                    if heater_is_on:
-                        await self.actor_off(self.heater)
-                        heater_is_on = False
-                        heat_percent_old = 0
+                    await self.actor_off(self.heater)
+                    heater_is_on = False
+                    heat_percent_old = 0
                     try:
                         self.cbpi.notify(
                             "Dry fire",
@@ -341,10 +343,9 @@ class BoilPower(CBPiKettleLogic):
                 if dry_watch is not None and dry_watch.note(
                     current_temp, dry_watts, dry_litres, degree_ratio
                 ):
-                    if heater_is_on:
-                        await self.actor_off(self.heater)
-                        heater_is_on = False
-                        heat_percent_old = 0
+                    await self.actor_off(self.heater)
+                    heater_is_on = False
+                    heat_percent_old = 0
                     try:
                         self.cbpi.notify(
                             "Dry fire",
@@ -388,9 +389,9 @@ class BoilPower(CBPiKettleLogic):
                         await self.actor_set_power(self.heater, heat_percent)
                         heat_percent_old = heat_percent
                 else:
-                    if heater_is_on:
-                        await self.actor_off(self.heater)
-                        heater_is_on = False
+                    # Unconditional, for the same reason as the guards above.
+                    await self.actor_off(self.heater)
+                    heater_is_on = False
                     heat_percent_old = 0
 
                 await clock.sleep(sample_time)
@@ -401,6 +402,18 @@ class BoilPower(CBPiKettleLogic):
             logging.exception("BoilPower error: %s", e)
         finally:
             self.running = False
+            # Tell the interface the logic has gone.
+            #
+            # Kettle.to_dict() reports state from instance.state, and nothing
+            # else clears it. A guard that stopped the loop therefore left the
+            # dashboard showing a running kettle with no controller behind it -
+            # observed as running=True for twenty seconds after the element had
+            # been de-energized. A control surface that claims to be in charge
+            # when it is not is worse than one that admits it stopped.
+            try:
+                self.state = False
+            except Exception:  # noqa: BLE001
+                pass
             heater = getattr(self, "heater", None)
             if heater is not None:
                 await self.actor_off(heater)
@@ -408,3 +421,4 @@ class BoilPower(CBPiKettleLogic):
 
 def setup(cbpi):
     cbpi.plugin.register("BoilPower", BoilPower)
+
