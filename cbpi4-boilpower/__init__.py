@@ -223,9 +223,26 @@ class BoilPower(CBPiKettleLogic):
     async def run(self):
         try:
             sample_time = int(self.props.get("SampleTime", self.DEFAULT_SAMPLE_TIME))
-            threshold = float(
+            configured = float(
                 self.props.get("Boil_Threshold", None) or self._default_threshold()
             )
+            # The kettle's setpoint wins when the brewer has set one.
+            #
+            # Control originally read Boil_Threshold only, which left the
+            # dashboard's temperature slider doing nothing at all on a kettle
+            # running this logic - two sliders, one of them dead - and the SV
+            # widget reading 0 because nothing ever published a setpoint.
+            #
+            # Taking the setpoint when there is one makes the existing slider
+            # set the boil threshold, which is a sensible thing for it to mean
+            # here, and leaves Boil_Threshold as the default it falls back to.
+            threshold = configured
+            try:
+                published = float(self.get_kettle_target_temp(self.id) or 0)
+                if published > 0:
+                    threshold = published
+            except (TypeError, ValueError, AttributeError):
+                pass
             max_output = self._clamp_percent(
                 self.props.get("Max_Output", self.DEFAULT_MAX_OUTPUT),
                 self.DEFAULT_MAX_OUTPUT,
@@ -261,6 +278,16 @@ class BoilPower(CBPiKettleLogic):
             self.kettle = self.get_kettle(self.id)
             self.heater = self.kettle.heater
             sensor_id = self.kettle.sensor
+
+            # Publish a setpoint if there is none, so the dashboard has
+            # something to show. Without this the SV widget read 0 and a
+            # running boil displayed "0 deg 85%", which tells the brewer
+            # nothing and looks broken.
+            try:
+                if not (float(self.kettle.target_temp or 0) > 0):
+                    self.kettle.target_temp = threshold
+            except Exception:  # noqa: BLE001 - a cosmetic field, never fatal
+                pass
 
             # Establish a known state without a pulse. A plain GPIOActor's on()
             # drives the pin high and ignores the power argument, so starting
