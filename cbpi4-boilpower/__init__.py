@@ -59,6 +59,13 @@ except ImportError:  # pragma: no cover - depends on the host installation
 
     clock = _RealClock()
 
+try:
+    # Same reasoning as the clock import: only forks carry this, and a plugin
+    # that cannot load is worse than one without dry-fire protection.
+    from cbpi.api.dryfire import DryFireWatch
+except ImportError:  # pragma: no cover - depends on the host installation
+    DryFireWatch = None
+
 
 @parameters([
     Property.Number(
@@ -75,6 +82,19 @@ except ImportError:  # pragma: no cover - depends on the host installation
     Property.Select(
         label="SampleTime", options=[2, 5],
         description="Seconds between control decisions. Matches PIDBoil."),
+    Property.Number(
+        label="Volume_Litres", configurable=True, default_value=0,
+        description="Litres in the vessel. With Element_Watts, enables dry-fire "
+                    "protection. 0 disables."),
+    Property.Number(
+        label="Element_Watts", configurable=True, default_value=0,
+        description="Element rating in watts. With Volume_Litres, enables "
+                    "dry-fire protection. 0 disables."),
+    Property.Number(
+        label="Max_Safe_Temp", configurable=True, default_value=0,
+        description="Cut the element if the vessel exceeds this. A boil kettle "
+                    "above boiling has already lost its liquid. 0 uses "
+                    "Boil_Threshold + 15 degrees."),
 ])
 class BoilPower(CBPiKettleLogic):
     """Ramp at full power, then hold a chosen duty."""
@@ -214,6 +234,30 @@ class BoilPower(CBPiKettleLogic):
             # new instance; lose it on a genuine restart.
             self._boil_power_override = getattr(self, "_boil_power_override", None)
 
+            # Dry-fire protection. Needs two facts no kettle carries - how much
+            # liquid is in it and how big the element is - so it does nothing
+            # until both are configured.
+            #
+            # This plugin shipped without it, and a simulated 40 L kettle left
+            # boiling at 85% ran itself dry and climbed to 404 F with the
+            # element still commanded on and nothing said to the brewer. On a
+            # real rig that is a destroyed element at best.
+            dry_watch = DryFireWatch() if DryFireWatch else None
+            dry_litres = max(0.0, float(self.props.get("Volume_Litres", 0) or 0))
+            dry_watts = max(0.0, float(self.props.get("Element_Watts", 0) or 0))
+            degree_ratio = 1.0 if self._unit() == "C" else 1.8
+
+            # A second, cruder guard that needs nothing configured.
+            #
+            # Dry-fire detection compares the rate of rise against what the
+            # element could physically achieve, which is precise but silent
+            # until someone fills in two properties. A boil kettle sitting well
+            # above boiling has already lost its liquid whatever the rate was,
+            # so this catches the same accident with no setup at all.
+            max_safe = float(self.props.get("Max_Safe_Temp", 0) or 0)
+            if max_safe <= 0:
+                max_safe = threshold + (15.0 * degree_ratio)
+
             self.kettle = self.get_kettle(self.id)
             self.heater = self.kettle.heater
             sensor_id = self.kettle.sensor
@@ -242,6 +286,50 @@ class BoilPower(CBPiKettleLogic):
                         heat_percent_old = 0
                     await clock.sleep(sample_time)
                     continue
+
+                # A boil kettle sitting well above boiling has already lost its
+                # liquid. This needs nothing configured, unlike the rate-based
+                # dry-fire check below, so it catches the accident on a rig
+                # where nobody filled in the volume and wattage.
+                if current_temp >= max_safe:
+                    if heater_is_on:
+                        await self.actor_off(self.heater)
+                        heater_is_on = False
+                        heat_percent_old = 0
+                    try:
+                        self.cbpi.notify(
+                            "Dry fire",
+                            "{} reached {:.1f}, past the {:.1f} safe limit. The "
+                            "element has been switched off - the vessel is "
+                            "almost certainly dry.".format(
+                                getattr(self.kettle, "name", "Kettle"),
+                                current_temp, max_safe),
+                            NotificationType.ERROR,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self.running = False
+                    break
+
+                if dry_watch is not None and dry_watch.note(
+                    current_temp, dry_watts, dry_litres, degree_ratio
+                ):
+                    if heater_is_on:
+                        await self.actor_off(self.heater)
+                        heater_is_on = False
+                        heat_percent_old = 0
+                    try:
+                        self.cbpi.notify(
+                            "Dry fire",
+                            dry_watch.describe(
+                                getattr(self.kettle, "name", "Kettle"), dry_litres
+                            ),
+                            NotificationType.ERROR,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self.running = False
+                    break
 
                 if current_temp >= threshold:
                     heat_percent = self._boil_power()
