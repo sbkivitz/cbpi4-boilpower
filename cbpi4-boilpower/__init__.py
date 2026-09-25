@@ -166,6 +166,29 @@ class BoilPower(CBPiKettleLogic):
             self.DEFAULT_BOIL_POWER,
         )
 
+    def _threshold(self):
+        """Where full power ends and the fixed duty begins, read fresh.
+
+        Read on every pass, not once before the loop. Captured up front, a
+        change to the kettle's setpoint did nothing until the logic was
+        restarted - so the dashboard's temperature slider, which is labelled as
+        the boil threshold, silently had no effect on a running boil. A control
+        that appears to work and does not is worse than one that is absent.
+
+        The kettle's setpoint wins when there is one, leaving Boil_Threshold as
+        the default it falls back to.
+        """
+        configured = float(
+            self.props.get("Boil_Threshold", None) or self._default_threshold()
+        )
+        try:
+            published = float(self.get_kettle_target_temp(self.id) or 0)
+            if published > 0:
+                return published
+        except (TypeError, ValueError, AttributeError):
+            pass
+        return configured
+
     def _read_temp(self, sensor_id):
         """Current temperature, or None if it cannot be trusted.
 
@@ -258,26 +281,10 @@ class BoilPower(CBPiKettleLogic):
     async def run(self):
         try:
             sample_time = int(self.props.get("SampleTime", self.DEFAULT_SAMPLE_TIME))
-            configured = float(
-                self.props.get("Boil_Threshold", None) or self._default_threshold()
-            )
-            # The kettle's setpoint wins when the brewer has set one.
-            #
-            # Control originally read Boil_Threshold only, which left the
-            # dashboard's temperature slider doing nothing at all on a kettle
-            # running this logic - two sliders, one of them dead - and the SV
-            # widget reading 0 because nothing ever published a setpoint.
-            #
-            # Taking the setpoint when there is one makes the existing slider
-            # set the boil threshold, which is a sensible thing for it to mean
-            # here, and leaves Boil_Threshold as the default it falls back to.
-            threshold = configured
-            try:
-                published = float(self.get_kettle_target_temp(self.id) or 0)
-                if published > 0:
-                    threshold = published
-            except (TypeError, ValueError, AttributeError):
-                pass
+            # The threshold itself is read per pass by _threshold(), so moving
+            # the setpoint acts on a running boil. Only the starting value is
+            # needed here, to publish a setpoint if the kettle has none.
+            threshold = self._threshold()
             max_output = self._clamp_percent(
                 self.props.get("Max_Output", self.DEFAULT_MAX_OUTPUT),
                 self.DEFAULT_MAX_OUTPUT,
@@ -306,9 +313,9 @@ class BoilPower(CBPiKettleLogic):
             # until someone fills in two properties. A boil kettle sitting well
             # above boiling has already lost its liquid whatever the rate was,
             # so this catches the same accident with no setup at all.
-            max_safe = float(self.props.get("Max_Safe_Temp", 0) or 0)
-            if max_safe <= 0:
-                max_safe = threshold + (15.0 * degree_ratio)
+            configured_max_safe = float(self.props.get("Max_Safe_Temp", 0) or 0)
+            if configured_max_safe <= 0:
+                configured_max_safe = 0.0
 
             self.kettle = self.get_kettle(self.id)
             self.heater = self.kettle.heater
@@ -340,6 +347,10 @@ class BoilPower(CBPiKettleLogic):
 
             while self.running:
                 current_temp = self._read_temp(sensor_id)
+                # Fresh every pass, so moving the setpoint acts on a running
+                # boil instead of waiting for a restart.
+                threshold = self._threshold()
+                max_safe = configured_max_safe or (threshold + (15.0 * degree_ratio))
 
                 if current_temp is None:
                     # No trustworthy reading. Heating blind toward a boil is the
