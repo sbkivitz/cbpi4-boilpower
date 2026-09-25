@@ -110,6 +110,19 @@ class BoilPower(CBPiKettleLogic):
     # Fallback only. The sensor's own cadence is preferred - see _read_temp.
     MAX_SENSOR_AGE = 30
 
+    # How far the wort must fall below the threshold before full power returns.
+    #
+    # Without this the loop chatters. A vessel held at the boil sits within a
+    # fraction of a degree of the threshold and crosses it repeatedly, so every
+    # control decision flips between Max_Output and Boil_Power - observed on
+    # the rig as 100/10/100/10 at two second intervals, which on an SSR is the
+    # element slamming between full and idle and a boil that visibly surges.
+    #
+    # PIDBoil documents the same defect and latches its boil for the same
+    # reason. Authored in Celsius and converted, like every other temperature
+    # default here.
+    BOIL_EXIT_DROP_C = 2.0
+
     def _unit(self):
         return str(self.get_config_value("TEMP_UNIT", "C")).upper()
 
@@ -199,6 +212,27 @@ class BoilPower(CBPiKettleLogic):
         self._boil_power_override = self._clamp_percent(
             Power, self.DEFAULT_BOIL_POWER
         )
+
+        # Persist it, so the interface and the element agree.
+        #
+        # This deliberately did not save, on the reasoning that adjusting
+        # vigour for one batch should not rewrite the recipe. That was wrong in
+        # practice: the dashboard slider seeds from Boil_Power, so it kept
+        # opening at the stored 85 while the element was actually running at
+        # 10, and the brewer had no way to see the value in force. A control
+        # surface that disagrees with the hardware is worse than one that
+        # remembers a number you can change back.
+        #
+        # save() only writes the file and pushes an update - unlike update(),
+        # it does not stop the logic - so this is safe during a boil.
+        try:
+            kettle = self.get_kettle(self.id)
+            if kettle is not None:
+                kettle.props["Boil_Power"] = self._boil_power_override
+                await self.cbpi.kettle.save()
+        except Exception as e:  # noqa: BLE001 - never fail a control action
+            logging.warning("BoilPower: could not persist Boil_Power: %s", e)
+
         logging.info(
             "BoilPower: duty set to %s%% (was %s%%)",
             self._boil_power_override, previous,
@@ -206,8 +240,9 @@ class BoilPower(CBPiKettleLogic):
         try:
             self.cbpi.notify(
                 getattr(getattr(self, "kettle", None), "name", "Boil"),
-                "Boil power now {}% (was {}%). This boil only; Boil_Power is "
-                "unchanged.".format(self._boil_power_override, previous),
+                "Boil power now {}% (was {}%).".format(
+                    self._boil_power_override, previous
+                ),
                 NotificationType.INFO,
             )
         except Exception:  # noqa: BLE001 - never fail a control action on a toast
@@ -299,6 +334,9 @@ class BoilPower(CBPiKettleLogic):
             heater_is_on = False
             heat_percent_old = 0
             announced_boil = False
+            # Once boiling, stay boiling until the wort genuinely comes off it.
+            boil_latched = False
+            exit_drop = self.BOIL_EXIT_DROP_C * degree_ratio
 
             while self.running:
                 current_temp = self._read_temp(sensor_id)
@@ -360,6 +398,14 @@ class BoilPower(CBPiKettleLogic):
                     break
 
                 if current_temp >= threshold:
+                    boil_latched = True
+                elif boil_latched and current_temp < threshold - exit_drop:
+                    # Genuinely off the boil - a lid opened, a chiller started,
+                    # or the element failed - so go back to getting it there.
+                    boil_latched = False
+                    announced_boil = False
+
+                if boil_latched:
                     heat_percent = self._boil_power()
                     if not announced_boil:
                         announced_boil = True
