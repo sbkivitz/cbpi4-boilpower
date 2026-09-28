@@ -14,6 +14,44 @@ below Boil_Threshold   ->  Max_Output, get there
 at or above it         ->  Boil_Power, hold that duty
 ```
 
+## What it deliberately does not do
+
+This is a dumb power controller. It has no temperature policy beyond the single
+threshold comparison, and that is a decision rather than an omission.
+
+It briefly had a maximum-temperature cut and a rate-of-rise dry-fire watch.
+Both were removed, because **a dry kettle's probe sits in air**. Air couples
+badly to a thermowell, so when a vessel boils dry the reading barely moves —
+the temperature does not run away, it goes quiet. Rate-of-rise dry-fire
+detection therefore has no true positives for the hazard it is named after, and
+only false ones. A false cut mid-boil ruins a batch.
+
+So the plugin will:
+
+- hold the configured duty at any temperature above the threshold, however high
+- hold full power indefinitely below it, even if the wort never climbs
+- never stop itself, and never raise a temperature alarm
+
+A kettle that will not climb means a failed element, a tripped breaker, or a
+probe out of the wort. The plugin cannot tell those apart, and each wants a
+different response from a person standing at the rig.
+
+**Over-temperature protection belongs in hardware** — a thermal cutout on the
+element, an in-line thermostat, or a GFCI. Do not rely on this plugin, or any
+other software in the loop, to de-energize a runaway element.
+
+## Boil latch
+
+Once the wort reaches the threshold the boil is latched, and full power does
+not return until it falls **2 °C** below it.
+
+Without that, a vessel held at the boil sits within a fraction of a degree of
+the threshold and crosses it repeatedly, so every control decision flips
+between `Max_Output` and `Boil_Power`. Observed on a rig as 100/10/100/10 at
+two-second intervals — on an SSR, the element slamming between full and idle
+and a boil that visibly surges. PIDBoil documents the same defect and latches
+for the same reason.
+
 ## Adjusting the boil while it runs
 
 Use the **Set boil power** action, from the dashboard.
@@ -58,6 +96,28 @@ behave as they are configured to.
 - `on_stop()` and the `finally` block both switch the heater off, so a
   cancelled task cannot leave the element energized.
 - Duty is clamped to 0–100 and never raises on a malformed value.
+- The element is driven from **what the actor reports**, not from what the loop
+  last commanded. Switch the heater off from the dashboard mid-boil and the
+  logic notices on the next pass and re-commands it, at the holding duty rather
+  than full power. An earlier version tracked this in a local variable and
+  wedged: the element stayed dark while the logic believed it was driving it,
+  until the automation was stopped and restarted.
+- If the actor cannot be read at all, the loop falls back to the duty it last
+  commanded instead of treating silence as *off*. Treating it as off would
+  re-issue `actor_on()` every pass — and `GPIOActor` implements its duty cycle
+  by sleeping an on-phase then an off-phase, so re-commanding part-way through
+  a window can restart it and hold the element on past the duty it was given.
+  The failure is logged once when it starts, not once per pass.
+
+## The dashboard setpoint
+
+The kettle's existing temperature slider writes `target_temp`, and this logic
+reads it as the boil threshold. That keeps the slider meaningful rather than
+dead, and stops the setpoint widget reading zero.
+
+Set it to your boiling point — around **210 °F / 99 °C**, adjusted for
+altitude. A low setpoint means the kettle latches "boiling" almost immediately
+and drops to the holding duty long before the wort is hot.
 
 ## Properties
 
@@ -77,3 +137,25 @@ never interpreted as Fahrenheit on a Fahrenheit rig.
 pip install .
 cbpi plugins add cbpi4-boilpower
 ```
+
+Then restart the server and set the kettle's **Logic** to `BoilPower`.
+
+Plugins are discovered through `pkgutil.iter_modules()` plus
+`importlib.metadata.version()`, so the package needs real distribution
+metadata. Copying the folder into place looks like it works and then silently
+fails to load — always `pip install`.
+
+## Tests
+
+`test_boilpower.py` in the testbench covers 44 checks, loading this file **by
+path** so a run can never pass against a stale installed copy.
+
+Two notes on what that suite is worth. It models the actor as real state that
+the commands mutate, because an earlier harness stubbed the commands as pure
+recorders and gave the logic a `cbpi` with no actor registry — so every read
+raised, reported *off*, and the tests measured a world that does not exist. And
+four of its checks were found to be incapable of failing: they asserted things
+guaranteed by the opening and closing de-energize that every run performs. Both
+were caught by running the plugin on a rig, not by the tests.
+
+Nothing here substitutes for watching the first boil.

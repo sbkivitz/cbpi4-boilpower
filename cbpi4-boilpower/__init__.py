@@ -76,16 +76,6 @@ except ImportError:  # pragma: no cover - depends on the host installation
     Property.Select(
         label="SampleTime", options=[2, 5],
         description="Seconds between control decisions. Matches PIDBoil."),
-    Property.Number(
-        label="Stall_Minutes", configurable=True, default_value=10,
-        description="Cut the element if it is heating below the threshold and "
-                    "the temperature has not risen for this long. Catches a dry "
-                    "vessel, a probe out of the liquid, and a dead element. "
-                    "0 disables."),
-    Property.Number(
-        label="Max_Safe_Temp", configurable=True, default_value=0,
-        description="Cut the element above this temperature. 0 uses boiling "
-                    "plus 10 degrees, which liquid cannot reach."),
 ])
 class BoilPower(CBPiKettleLogic):
     """Ramp at full power, then hold a chosen duty."""
@@ -97,6 +87,11 @@ class BoilPower(CBPiKettleLogic):
     DEFAULT_BOIL_POWER = 85
     DEFAULT_MAX_OUTPUT = 100
     DEFAULT_SAMPLE_TIME = 5
+
+    # Floor for SampleTime. GPIOActor derives its on-phase from this value, and
+    # at zero neither branch of its duty cycle sleeps - which starves the event
+    # loop rather than merely running fast.
+    MIN_SAMPLE_TIME = 0.1
 
     # Fallback only. The sensor's own cadence is preferred - see _read_temp.
     MAX_SENSOR_AGE = 30
@@ -121,6 +116,29 @@ class BoilPower(CBPiKettleLogic):
         if self._unit() == "C":
             return self.DEFAULT_THRESHOLD_C
         return self.DEFAULT_THRESHOLD_C * 9.0 / 5.0 + 32.0
+
+    def _sample_time(self):
+        """Seconds between control decisions. Never raises.
+
+        This was a bare int(), which raises on "2.5" or on anything a human
+        might type into a free-text field - and an exception here escapes into
+        run()'s handler and kills the control loop before it has switched the
+        element off once. Every other property on this class is parsed
+        defensively; this one was the exception, for no reason.
+
+        Floored rather than clamped to the Select options, because a fork or a
+        hand-edited config file may legitimately carry something else. The
+        floor exists because GPIOActor derives its on-phase from this value:
+        at zero, neither branch of its duty cycle sleeps and it starves the
+        event loop.
+        """
+        try:
+            seconds = float(self.props.get("SampleTime", self.DEFAULT_SAMPLE_TIME))
+        except (TypeError, ValueError):
+            return self.DEFAULT_SAMPLE_TIME
+        if seconds != seconds:  # NaN
+            return self.DEFAULT_SAMPLE_TIME
+        return max(self.MIN_SAMPLE_TIME, seconds)
 
     @staticmethod
     def _clamp_percent(value, default):
@@ -193,14 +211,86 @@ class BoilPower(CBPiKettleLogic):
     # above boiling means there is nothing left to boil. That is an absolute
     # fact about the vessel, independent of what the brewer asked for, which is
     # what a last-resort guard should be keyed on.
-    DRY_ABOVE_BOILING_C = 10.0
-    BOILING_C = 100.0
+    def _heater_now(self):
+        """What the heater actor is actually doing: (on, power, known).
 
-    def _default_max_safe(self):
-        ceiling_c = self.BOILING_C + self.DRY_ABOVE_BOILING_C
-        if self._unit() == "C":
-            return ceiling_c
-        return ceiling_c * 9.0 / 5.0 + 32.0
+        Read rather than remembered. A loop that tracks the element's state in
+        a local variable is wrong the moment anything else touches the actor -
+        and on a rig, the brewer is something else that touches the actor.
+
+        The third value is the one that matters for safety. This used to return
+        (False, None) both when the actor was genuinely off and when it could
+        not be read at all, and the caller cannot tell those apart: "off" means
+        command it on, so an unreadable actor made the loop re-issue actor_on()
+        every single pass, for ever.
+
+        That is not a cosmetic difference. GPIOActor implements its duty cycle
+        by sleeping through an on-phase and an off-phase, so re-commanding it
+        part-way through a window can restart that window and hold the element
+        on past the duty it was given - delivering more power than asked for,
+        which is the one failure this plugin must never have.
+
+        So: known=False means "no idea", and the caller keeps using what it
+        last commanded instead of treating silence as off.
+
+        Never raises.
+        """
+        try:
+            registry = getattr(self.cbpi, "actor", None)
+            if registry is None:
+                self._note_read_failure("no actor registry")
+                return False, None, False
+            actor = registry.find_by_id(self.heater)
+            if actor is None:
+                # A genuinely absent actor is knowledge, not an error: there is
+                # nothing energized, so commanding it on is the right response.
+                self._heater_read_ok = True
+                return False, None, True
+            power = getattr(actor, "power", None)
+            self._heater_read_ok = True
+            return bool(getattr(actor, "state", False)), power, True
+        except Exception as e:  # noqa: BLE001
+            self._note_read_failure(e)
+            return False, None, False
+
+    def _note_read_failure(self, reason):
+        """Log an unreadable heater once per episode, not once per pass.
+
+        The loop reads the actor every SampleTime, so logging a traceback on
+        each failure buries a brew day's log in thousands of copies of the same
+        stack - and the log is the only record of what the rig did. One entry
+        when it breaks, one when it recovers.
+        """
+        if getattr(self, "_heater_read_ok", True):
+            self._heater_read_ok = False
+            logging.exception(
+                "BoilPower: cannot read heater %s (%s). Falling back to the "
+                "last commanded duty until it can be read again.",
+                getattr(self, "heater", None), reason,
+            )
+
+    def _tell(self, title, message, level=NotificationType.INFO):
+        """Say something to the brewer, and write it down.
+
+        PIDBoil logs a message and then notifies it, so anything a brewer was
+        told can be found afterwards. This plugin only notified, and the gap
+        showed the first time it mattered: asked what warning had stopped a
+        brew day, there was nothing in the log to answer with - the message had
+        to be reconstructed from arithmetic on the current settings.
+
+        One call does both, so the two cannot drift apart.
+        """
+        text = "{}: {}".format(title, message)
+        if level == NotificationType.ERROR:
+            logging.error(text)
+        elif level == NotificationType.WARNING:
+            logging.warning(text)
+        else:
+            logging.info(text)
+        try:
+            self.cbpi.notify(title, message, level)
+        except Exception:  # noqa: BLE001 - never fail control on a toast
+            pass
 
     def _read_temp(self, sensor_id):
         """Current temperature, or None if it cannot be trusted.
@@ -269,20 +359,12 @@ class BoilPower(CBPiKettleLogic):
         except Exception as e:  # noqa: BLE001 - never fail a control action
             logging.warning("BoilPower: could not persist Boil_Power: %s", e)
 
-        logging.info(
-            "BoilPower: duty set to %s%% (was %s%%)",
-            self._boil_power_override, previous,
+        self._tell(
+            getattr(getattr(self, "kettle", None), "name", "Boil"),
+            "Boil power now {}% (was {}%).".format(
+                self._boil_power_override, previous
+            ),
         )
-        try:
-            self.cbpi.notify(
-                getattr(getattr(self, "kettle", None), "name", "Boil"),
-                "Boil power now {}% (was {}%).".format(
-                    self._boil_power_override, previous
-                ),
-                NotificationType.INFO,
-            )
-        except Exception:  # noqa: BLE001 - never fail a control action on a toast
-            pass
 
     async def on_stop(self):
         # Guarded: run() may have raised before self.heater was assigned, and an
@@ -293,7 +375,7 @@ class BoilPower(CBPiKettleLogic):
 
     async def run(self):
         try:
-            sample_time = int(self.props.get("SampleTime", self.DEFAULT_SAMPLE_TIME))
+            sample_time = self._sample_time()
             # The threshold itself is read per pass by _threshold(), so moving
             # the setpoint acts on a running boil. Only the starting value is
             # needed here, to publish a setpoint if the kettle has none.
@@ -308,40 +390,20 @@ class BoilPower(CBPiKettleLogic):
 
             degree_ratio = 1.0 if self._unit() == "C" else 1.8
 
-            # A stall is the real signal that a vessel is dry.
+            # Nothing else here is concerned with temperature.
             #
-            # A rate-of-rise check was tried first and removed: in a genuinely
-            # dry kettle the probe sits in air, which couples to a thermowell
-            # badly, so the reading barely moves while the element glows and
-            # destroys itself. A detector looking for "rising faster than
-            # physics allows" therefore has no true positives for the thing it
-            # was built for, and only false ones - it tripped a healthy boil on
-            # this rig. Worse than nothing, because it stops a brew day and
-            # buys no safety.
+            # This logic is a dumb power controller: full output until the wort
+            # reaches the threshold, then the duty the brewer chose. The only
+            # question it asks about temperature is which of those two it is
+            # in.
             #
-            # The inverse is what actually shows: the element commanded and
-            # nothing happening. That catches a dry vessel, a probe lifted out
-            # of the liquid, and a dead element, with one check.
-            #
-            # Only while heating TOWARDS the threshold. Once boiling, a flat
-            # temperature is exactly correct - the energy is going into vapour
-            # - so a stall watch that ran during the boil would fire on every
-            # successful one.
-            stall_limit = max(0.0, float(self.props.get("Stall_Minutes", 10) or 0)) * 60
-            stall_anchor_temp = None
-            stall_anchor_at = None
-
-            # A second, cruder guard that needs nothing configured.
-            #
-            # Dry-fire detection compares the rate of rise against what the
-            # element could physically achieve, which is precise but silent
-            # until someone fills in two properties. A boil kettle sitting well
-            # above boiling has already lost its liquid whatever the rate was,
-            # so this catches the same accident with no setup at all.
-            configured_max_safe = float(self.props.get("Max_Safe_Temp", 0) or 0)
-            if configured_max_safe <= 0:
-                configured_max_safe = 0.0
-
+            # It previously carried two safety guards - an over-temperature
+            # ceiling and a stall watch - and both were removed. Each ruined a
+            # brew day by cutting the element on a healthy kettle, and neither
+            # belongs here: a limit that stops heating is a policy about the
+            # vessel, not about how hard to boil it, and burying it in a power
+            # controller means every logic has to reimplement it and get it
+            # wrong separately. Those limits belong in a layer that owns them.
             self.kettle = self.get_kettle(self.id)
             self.heater = self.kettle.heater
             sensor_id = self.kettle.sensor
@@ -363,9 +425,10 @@ class BoilPower(CBPiKettleLogic):
             # an element left on by a previous run would otherwise stay on while
             # this loop believed it was off.
             await self.actor_off(self.heater)
-            heater_is_on = False
-            heat_percent_old = 0
             announced_boil = False
+            # What this loop last commanded, used only when the actor cannot be
+            # read. Starts as 0 because the line above just de-energized it.
+            commanded = 0
             # Once boiling, stay boiling until the wort genuinely comes off it.
             boil_latched = False
             exit_drop = self.BOIL_EXIT_DROP_C * degree_ratio
@@ -375,75 +438,21 @@ class BoilPower(CBPiKettleLogic):
                 # Fresh every pass, so moving the setpoint acts on a running
                 # boil instead of waiting for a restart.
                 threshold = self._threshold()
-                max_safe = configured_max_safe or self._default_max_safe()
 
                 if current_temp is None:
-                    # No trustworthy reading. Heating blind toward a boil is the
-                    # one thing not to do, so the element comes off until a real
-                    # measurement returns.
+                    # No trustworthy reading. This is not a temperature policy,
+                    # it is refusing to act on garbage: with no measurement
+                    # there is no way to know whether to be at full power or at
+                    # the holding duty, so the element comes off until a real
+                    # one returns.
                     #
                     # Unconditional: commanding off something already off costs
                     # one redundant call, while not commanding off something
                     # that IS on is how an element stays live.
                     await self.actor_off(self.heater)
-                    heater_is_on = False
-                    heat_percent_old = 0
+                    commanded = 0
                     await clock.sleep(sample_time)
                     continue
-
-                # A boil kettle sitting well above boiling has already lost its
-                # liquid. This needs nothing configured, unlike the rate-based
-                # dry-fire check below, so it catches the accident on a rig
-                # where nobody filled in the volume and wattage.
-                if current_temp >= max_safe:
-                    await self.actor_off(self.heater)
-                    heater_is_on = False
-                    heat_percent_old = 0
-                    try:
-                        self.cbpi.notify(
-                            "Dry fire",
-                            "{} reached {:.1f}, past the {:.1f} safe limit. The "
-                            "element has been switched off - the vessel is "
-                            "almost certainly dry.".format(
-                                getattr(self.kettle, "name", "Kettle"),
-                                current_temp, max_safe),
-                            NotificationType.ERROR,
-                        )
-                    except Exception:  # noqa: BLE001
-                        pass
-                    self.running = False
-                    break
-
-                # Heating towards the threshold and getting nowhere.
-                if (stall_limit > 0 and heater_is_on and not boil_latched
-                        and current_temp < threshold):
-                    if (stall_anchor_temp is None
-                            or current_temp > stall_anchor_temp + 0.5):
-                        stall_anchor_temp = current_temp
-                        stall_anchor_at = clock.now()
-                    elif clock.now() - stall_anchor_at >= stall_limit:
-                        await self.actor_off(self.heater)
-                        heater_is_on = False
-                        heat_percent_old = 0
-                        try:
-                            self.cbpi.notify(
-                                "Heating stalled",
-                                "'{}' has been heating for {:.0f} minutes "
-                                "without rising - it stopped at {:.1f}. An "
-                                "empty vessel, a probe out of the liquid or a "
-                                "dead element all look like this. The element "
-                                "has been switched off.".format(
-                                    getattr(self.kettle, "name", "Kettle"),
-                                    stall_limit / 60.0, current_temp),
-                                NotificationType.ERROR,
-                            )
-                        except Exception:  # noqa: BLE001
-                            pass
-                        self.running = False
-                        break
-                else:
-                    stall_anchor_temp = None
-                    stall_anchor_at = None
 
                 if current_temp >= threshold:
                     boil_latched = True
@@ -457,36 +466,54 @@ class BoilPower(CBPiKettleLogic):
                     heat_percent = self._boil_power()
                     if not announced_boil:
                         announced_boil = True
-                        try:
-                            self.cbpi.notify(
-                                getattr(self.kettle, "name", "Boil"),
-                                "Boiling at {:.1f}. Holding {}% - adjust from the "
-                                "dashboard.".format(current_temp, heat_percent),
-                                NotificationType.INFO,
-                            )
-                        except Exception:  # noqa: BLE001
-                            pass
+                        self._tell(
+                            getattr(self.kettle, "name", "Boil"),
+                            "Boiling at {:.1f}. Holding {}% - adjust from the "
+                            "dashboard.".format(current_temp, heat_percent),
+                        )
                 else:
                     heat_percent = max_output
                     announced_boil = False
 
-                # Drive the actor's on/off state, not just its power level.
-                # set_power() only forwards a number to the instance; it never
-                # changes state, so a demand of 0% would leave a plain GPIOActor
-                # nominally on at 0% duty rather than genuinely off.
+                # Drive the actor from what it IS doing, not from what this loop
+                # last told it to do.
+                #
+                # These were tracked in locals - heater_is_on, heat_percent_old
+                # - and commanded only on a believed transition. Switch the
+                # element off from the dashboard and the loop still believed it
+                # was on, so it never commanded again: the element stayed dark
+                # while the logic went on thinking it was driving it, until the
+                # brewer stopped and restarted the automation.
+                #
+                # That is the same desync ActorController.off had, where acting
+                # only when the software believed the actor was already on made
+                # switching off a no-op exactly when it was needed. Belief about
+                # hardware goes stale the moment anything else touches it, and
+                # on a rig the brewer is something else that touches it.
+                #
+                # Reading the actor costs one dictionary lookup per control
+                # decision and cannot go stale.
+                actual_on, actual_power, known = self._heater_now()
+
+                if not known:
+                    # Could not read the element. Fall back to what this loop
+                    # last commanded, which is the best information left.
+                    #
+                    # Treating unreadable as off would re-command every pass and
+                    # disturb the actor's duty cycle - see _heater_now.
+                    actual_on = commanded is not None and commanded > 0
+                    actual_power = commanded
+
                 if heat_percent > 0:
-                    if not heater_is_on:
+                    if not actual_on:
                         await self.actor_on(self.heater, heat_percent)
-                        heater_is_on = True
-                        heat_percent_old = heat_percent
-                    elif heat_percent != heat_percent_old:
+                    elif actual_power != heat_percent:
                         await self.actor_set_power(self.heater, heat_percent)
-                        heat_percent_old = heat_percent
+                    commanded = heat_percent
                 else:
                     # Unconditional, for the same reason as the guards above.
                     await self.actor_off(self.heater)
-                    heater_is_on = False
-                    heat_percent_old = 0
+                    commanded = 0
 
                 await clock.sleep(sample_time)
 
