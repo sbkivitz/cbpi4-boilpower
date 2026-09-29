@@ -345,6 +345,22 @@ class BoilPower(CBPiKettleLogic):
             )
             return None
 
+        # float() accepts NaN and both infinities, and neither is a temperature.
+        #
+        # A NaN fails every comparison, so `current_temp >= threshold` is False
+        # and the loop concludes the wort is below the boil - demanding full
+        # power on a reading that says nothing at all. After the latch it is
+        # worse: the latch is never released either, so the kettle is stuck on
+        # whichever side of the threshold it happened to be.
+        #
+        # An infinity compares cleanly and is just as meaningless.
+        if value != value or value in (float("inf"), float("-inf")):
+            logging.warning(
+                "BoilPower: ignoring sensor %s, reading is %r",
+                sensor_id, value,
+            )
+            return None
+
         age = state.get("age")
         limit = state.get("max_age") or self.MAX_SENSOR_AGE
         if age is not None and age > limit:
