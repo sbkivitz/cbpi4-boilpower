@@ -3,6 +3,27 @@
 A boil kettle logic for CraftBeerPi 4. Full power until the wort boils, then a
 fixed element duty the brewer sets from the dashboard.
 
+> ## ⚠️ Read before you run this
+>
+> This software switches mains-voltage heating elements drawing several
+> kilowatts. It can boil a vessel dry, scald, start a fire, or destroy an
+> element.
+>
+> **It is offered with no warranty of any kind, and is not certified for any
+> purpose.** You are responsible for your own rig.
+>
+> - **Hardware protection is mandatory, not optional.** This logic has *no*
+>   over-temperature cut-out and no dry-fire detection, by design — see
+>   *What it deliberately does not do*. A thermal cutout on the element, an
+>   in-line thermostat and a GFCI/RCD are what keep a fault from becoming a
+>   fire. Software is not a safety device.
+> - **Do not run a boil unattended.**
+> - **Test with water before you brew with it**, at the power levels you intend
+>   to use.
+> - Verify your own wiring, contactor or SSR ratings, and element ratings.
+>
+> If any of that is not true of your setup, do not use this.
+
 ## Why
 
 A boil does not need a PID. Once wort is boiling its temperature stops being a
@@ -51,6 +72,46 @@ between `Max_Output` and `Boil_Power`. Observed on a rig as 100/10/100/10 at
 two-second intervals — on an SSR, the element slamming between full and idle
 and a boil that visibly surges. PIDBoil documents the same defect and latches
 for the same reason.
+
+## What it needs outside this repository
+
+The plugin runs on stock CraftBeerPi 4. The **dashboard slider does not** — that
+lives in the interface repository, and the two are wired together by three
+strings that nothing in either repository checks on its own.
+
+| What | This plugin | `craftbeerpi4-ui` |
+|---|---|---|
+| Logic name | `cbpi.plugin.register("BoilPower", …)` | `isBoilPowerKettle()` matches `boilpower` |
+| Action name | `async def set_boil_power` | `kettleapi.action(id, "set_boil_power", …)` |
+| Parameter | `Property.Number(label="Power")` | `{ Power: power }` |
+
+Rename any one of them on either side and nothing fails loudly: the plugin still
+loads, the kettle still boils, and the slider silently stops working — or worse,
+the dialog closes as though the value were accepted.
+
+`test_boilpower_ui_contract.py` in the testbench asserts all three agree, and
+skips rather than fails when the interface repository is not checked out.
+
+**Without the interface changes** you still get the logic; the only way to change
+boil power mid-boil is the HTTP action:
+
+```
+POST /kettle/{id}/action   {"name": "set_boil_power", "parameter": {"Power": 60}}
+```
+
+### Core version
+
+Nothing here requires a patched core, but two fixes in this fork make it behave
+correctly rather than merely work:
+
+- `ActorController.set_power` pushes a websocket update when the duty changes,
+  so the dashboard shows the duty actually in force rather than the previous one.
+- `BasicController.call_action` reports *"its logic is not running"* instead of
+  blaming the `@action` decorator, and notifies the brewer — without it, setting
+  a power before starting the logic is silently dropped with HTTP 204.
+
+`cbpi.api.clock` is used when present and guarded by `try/ImportError`, so the
+plugin loads on an unmodified CraftBeerPi.
 
 ## Adjusting the boil while it runs
 
