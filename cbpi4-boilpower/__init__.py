@@ -277,9 +277,30 @@ class BoilPower(CBPiKettleLogic):
                 # nothing energized, so commanding it on is the right response.
                 self._heater_read_ok = True
                 return False, None, True
-            power = getattr(actor, "power", None)
+
+            # Prefer the driver's own state over the dataclass field.
+            #
+            # find_by_id returns the container, and its `state` is not what
+            # commands update - the instance's is, and that is what to_dict
+            # serialises. Reading the container could therefore report the
+            # actor off while the driver had it on, which defeats the
+            # reconciliation this function exists to perform and makes the loop
+            # re-issue ON every decision.
+            instance = getattr(actor, "instance", None)
+            if instance is not None:
+                state = getattr(instance, "state", None)
+                power = getattr(instance, "power", getattr(actor, "power", None))
+            else:
+                state = getattr(actor, "state", None)
+                power = getattr(actor, "power", None)
+
+            if state is None:
+                # Unknown is not off. Saying off would command it on.
+                self._note_read_failure("actor reports no state")
+                return False, None, False
+
             self._heater_read_ok = True
-            return bool(getattr(actor, "state", False)), power, True
+            return bool(state), power, True
         except Exception as e:  # noqa: BLE001
             self._note_read_failure(e)
             return False, None, False
