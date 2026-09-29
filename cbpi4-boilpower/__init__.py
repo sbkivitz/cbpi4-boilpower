@@ -145,15 +145,26 @@ class BoilPower(CBPiKettleLogic):
         """A duty percentage, bounded to 0-100. Never raises.
 
         Anything deciding how long a five kilowatt element stays on has to cope
-        with whatever arrives - a blank field, text, a NaN - without throwing
-        inside the control loop.
+        with whatever arrives - a blank field, text, a NaN, an infinity -
+        without throwing inside the control loop.
+
+        `default` is returned unchanged when the value cannot be read, so a
+        caller can pass None to mean "tell me it was unreadable" rather than
+        being handed a number it did not ask for. int(None) used to raise here,
+        which made that impossible.
         """
+        def fallback():
+            return default if default is None else int(default)
+
         try:
             numeric = float(value)
         except (TypeError, ValueError):
-            return int(default)
-        if numeric != numeric:  # NaN
-            return int(default)
+            return fallback()
+        # NaN and both infinities. NaN fails every comparison, so min/max would
+        # propagate it straight into a duty cycle; infinity would clamp to a
+        # number but says nothing about what the caller meant.
+        if numeric != numeric or numeric in (float("inf"), float("-inf")):
+            return fallback()
         return int(max(0, min(100, numeric)))
 
     def _boil_power(self):
@@ -328,8 +339,9 @@ class BoilPower(CBPiKettleLogic):
         "Set boil power",
         [Property.Number(
             label="Boil_Power", configurable=True, default_value=85,
-            description="Element duty while boiling, 0-100%. Takes effect on the "
-                        "next control decision without interrupting the boil.")],
+            min=0, max=100, step=1, unit="%",
+            description="Element duty while boiling. Takes effect on the next "
+                        "control decision without interrupting the boil.")],
     )
     async def set_boil_power(self, Boil_Power=None, Power=None, **kwargs):
         """Change boil vigour on a running boil, without cutting the element.
@@ -347,9 +359,28 @@ class BoilPower(CBPiKettleLogic):
         if Boil_Power is None:
             Boil_Power = Power
         previous = self._boil_power()
-        self._boil_power_override = self._clamp_percent(
-            Boil_Power, self.DEFAULT_BOIL_POWER
-        )
+
+        # An unreadable value leaves the duty alone rather than falling back to
+        # the class default.
+        #
+        # It used to clamp to DEFAULT_BOIL_POWER, so clearing the field while
+        # boiling at 20% and pressing Set asked for 85% - a large, silent
+        # increase in boil vigour from an incomplete edit, which is a boilover
+        # rather than a typo. A default is the right answer for a property that
+        # has never been configured, and the wrong one for a live command that
+        # arrived malformed.
+        requested = self._clamp_percent(Boil_Power, None)
+        if requested is None:
+            self._tell(
+                getattr(getattr(self, "kettle", None), "name", "Boil"),
+                "Ignored a boil power of {!r} - holding {}%.".format(
+                    Boil_Power, previous
+                ),
+                NotificationType.WARNING,
+            )
+            return
+
+        self._boil_power_override = requested
 
         # Persist it, so the interface and the element agree.
         #
