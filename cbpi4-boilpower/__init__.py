@@ -327,16 +327,28 @@ class BoilPower(CBPiKettleLogic):
     @action(
         "Set boil power",
         [Property.Number(
-            label="Power", configurable=True,
+            label="Boil_Power", configurable=True, default_value=85,
             description="Element duty while boiling, 0-100%. Takes effect on the "
-                        "next control decision without interrupting the boil. Not "
-                        "saved - change Boil_Power to set it permanently.")],
+                        "next control decision without interrupting the boil.")],
     )
-    async def set_boil_power(self, Power=None, **kwargs):
-        """Change boil vigour on a running boil, without cutting the element."""
+    async def set_boil_power(self, Boil_Power=None, Power=None, **kwargs):
+        """Change boil vigour on a running boil, without cutting the element.
+
+        The parameter is labelled `Boil_Power` to match the property it sets.
+        That is a convention rather than a requirement, and it is what lets a
+        generic interface open the field showing the duty currently in force
+        instead of blank: the dialog seeds any action parameter whose label
+        matches a configured property. A field that opens empty and is then
+        submitted writes a power of nothing.
+
+        `Power` is still accepted, because an earlier version of this plugin
+        declared it under that name and something may still be calling it.
+        """
+        if Boil_Power is None:
+            Boil_Power = Power
         previous = self._boil_power()
         self._boil_power_override = self._clamp_percent(
-            Power, self.DEFAULT_BOIL_POWER
+            Boil_Power, self.DEFAULT_BOIL_POWER
         )
 
         # Persist it, so the interface and the element agree.
