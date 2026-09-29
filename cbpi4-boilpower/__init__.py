@@ -225,8 +225,21 @@ class BoilPower(CBPiKettleLogic):
             published = float(self.get_kettle_target_temp(self.id) or 0)
             if published > 0 and published == published:
                 return published
-        except (TypeError, ValueError, AttributeError):
-            pass
+        except Exception:  # noqa: BLE001
+            # Broad on purpose. This calls out into the core, and the core
+            # calls out into whatever is registered - a plugin, a database, a
+            # controller that has been torn down. Catching only the arithmetic
+            # errors meant anything else propagated out of _threshold, out of
+            # the control loop, and the loop died silently: measured as zero
+            # sensor reads and zero commands for the rest of the brew, while
+            # the interface still showed the logic running.
+            #
+            # The configured fallback below is a perfectly good answer, so
+            # there is nothing to gain by failing.
+            logging.warning(
+                "BoilPower: could not read the kettle setpoint, using %.1f",
+                configured,
+            )
         return configured
 
     # A vessel this far above boiling is dry, whatever the setpoint says.
