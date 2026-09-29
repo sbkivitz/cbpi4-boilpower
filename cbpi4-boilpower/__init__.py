@@ -197,13 +197,33 @@ class BoilPower(CBPiKettleLogic):
 
         The kettle's setpoint wins when there is one, leaving Boil_Threshold as
         the default it falls back to.
+
+        Never raises. The configured value is a free-text property, so it can
+        be anything a brewer types, and a bare float() on it raised out of
+        run() before the heater had even been resolved - which meant both
+        cleanup paths skipped the de-energize and a failed start could leave an
+        already-on element running with no logic behind it.
         """
-        configured = float(
-            self.props.get("Boil_Threshold", None) or self._default_threshold()
-        )
+        configured = self._default_threshold()
+        raw = self.props.get("Boil_Threshold", None)
+        if raw is not None and raw != "":
+            try:
+                parsed = float(raw)
+                if parsed == parsed and parsed not in (float("inf"), float("-inf")):
+                    configured = parsed
+                else:
+                    logging.warning(
+                        "BoilPower: ignoring Boil_Threshold %r, using %.1f",
+                        raw, configured,
+                    )
+            except (TypeError, ValueError):
+                logging.warning(
+                    "BoilPower: ignoring Boil_Threshold %r, using %.1f",
+                    raw, configured,
+                )
         try:
             published = float(self.get_kettle_target_temp(self.id) or 0)
-            if published > 0:
+            if published > 0 and published == published:
                 return published
         except (TypeError, ValueError, AttributeError):
             pass
@@ -418,6 +438,31 @@ class BoilPower(CBPiKettleLogic):
 
     async def run(self):
         try:
+            # Resolve the hardware and establish a known state first.
+            #
+            # This used to parse the sample time, threshold and max output
+            # before touching the kettle, so anything that raised in there -
+            # and Boil_Threshold is a free-text property a brewer can type
+            # anything into - escaped before self.heater existed. Both cleanup
+            # paths are guarded on that attribute, so they skipped the
+            # de-energize, and a failed start left an element that was already
+            # on running with no logic behind it. Nothing in the interface said
+            # so; the kettle simply showed as stopped.
+            #
+            # Nothing below this point is needed to switch a heater off, so
+            # nothing below this point runs before it.
+            self.kettle = self.get_kettle(self.id)
+            self.heater = self.kettle.heater
+            sensor_id = self.kettle.sensor
+
+            # Establish a known state without a pulse. A plain GPIOActor's on()
+            # drives the pin high and ignores the power argument, so starting
+            # with "on at max_output" is really "on at 100%" before a single
+            # temperature has been read. Actor state also survives a restart, so
+            # an element left on by a previous run would otherwise stay on while
+            # this loop believed it was off.
+            await self.actor_off(self.heater)
+
             sample_time = self._sample_time()
             # The threshold itself is read per pass by _threshold(), so moving
             # the setpoint acts on a running boil. Only the starting value is
@@ -447,9 +492,6 @@ class BoilPower(CBPiKettleLogic):
             # vessel, not about how hard to boil it, and burying it in a power
             # controller means every logic has to reimplement it and get it
             # wrong separately. Those limits belong in a layer that owns them.
-            self.kettle = self.get_kettle(self.id)
-            self.heater = self.kettle.heater
-            sensor_id = self.kettle.sensor
 
             # Publish a setpoint if there is none, so the dashboard has
             # something to show. Without this the SV widget read 0 and a
@@ -460,14 +502,6 @@ class BoilPower(CBPiKettleLogic):
                     self.kettle.target_temp = threshold
             except Exception:  # noqa: BLE001 - a cosmetic field, never fatal
                 pass
-
-            # Establish a known state without a pulse. A plain GPIOActor's on()
-            # drives the pin high and ignores the power argument, so starting
-            # with "on at max_output" is really "on at 100%" before a single
-            # temperature has been read. Actor state also survives a restart, so
-            # an element left on by a previous run would otherwise stay on while
-            # this loop believed it was off.
-            await self.actor_off(self.heater)
             announced_boil = False
             # What this loop last commanded, used only when the actor cannot be
             # read. Starts as 0 because the line above just de-energized it.
