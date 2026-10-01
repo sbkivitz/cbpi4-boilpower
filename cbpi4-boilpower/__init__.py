@@ -411,10 +411,17 @@ class BoilPower(CBPiKettleLogic):
             label="Boil_Power", configurable=True, default_value=85,
             min=0, max=100, step=1, unit="%",
             description="Element duty while boiling. Takes effect on the next "
-                        "control decision without interrupting the boil.")],
+                        "control decision, and can be set before the boil "
+                        "starts.")],
+        # Boil power is a configured property, not a command. Refusing to set
+        # it while the logic is stopped made it unreachable at the one moment a
+        # brewer most naturally reaches for it - before starting the boil - and
+        # answered "start the kettle first", which is backwards. Setting it
+        # stopped simply persists it for the next run.
+        allow_stopped=True,
     )
     async def set_boil_power(self, Boil_Power=None, Power=None, **kwargs):
-        """Change boil vigour on a running boil, without cutting the element.
+        """Change boil vigour, running or not.
 
         The parameter is labelled `Boil_Power` to match the property it sets.
         That is a convention rather than a requirement, and it is what lets a
