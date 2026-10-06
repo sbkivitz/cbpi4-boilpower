@@ -6,7 +6,7 @@ with open(path.join(this_directory, 'README.md'), encoding='utf-8') as f:
     long_description = f.read()
 
 setup(name='cbpi4-boilpower',
-      version='0.0.2',
+      version='0.0.3',
       description='CraftBeerPi4 boil kettle logic: full power to the boil, then a duty the brewer sets from the dashboard',
       author='Scott Kivitz',
       url='https://github.com/sbkivitz/cbpi4-boilpower',
