@@ -73,6 +73,25 @@ except ImportError:  # pragma: no cover - depends on the host installation
     Property.Number(
         label="Max_Output", configurable=True, default_value=100,
         description="Element duty while heating up to the threshold."),
+    Property.Number(
+        label="Hold_Target", configurable=True,
+        description="Temperature to HOLD instead of boiling - a whirlpool or "
+                    "hop stand. Leave blank for an ordinary boil. Must be "
+                    "below the boil point; a value at or above it is ignored. "
+                    "This is deliberately separate from the kettle setpoint, "
+                    "because the setpoint already means 'where my boil is' - "
+                    "which is how a lower-temperature or high-altitude boil is "
+                    "expressed. Settable mid-brew from the dashboard."),
+    Property.Number(
+        label="Hold_Power", configurable=True, default_value=30,
+        description="Element duty while holding a setpoint BELOW boiling - a "
+                    "whirlpool or hop stand. Set the kettle target below the "
+                    "boil threshold and this logic holds it with on/off "
+                    "control at this duty instead of boiling. Modest on "
+                    "purpose: a hold replaces standing losses rather than "
+                    "ramping, and full power on a full kettle overshoots "
+                    "straight back to a boil. Raise it for a poorly insulated "
+                    "vessel."),
     Property.Select(
         label="SampleTime", options=[2, 5],
         description="Seconds between control decisions. Matches PIDBoil."),
@@ -85,6 +104,10 @@ class BoilPower(CBPiKettleLogic):
     # a 20 C ambient became 20 F elsewhere in this project.
     DEFAULT_THRESHOLD_C = 99.0
     DEFAULT_BOIL_POWER = 85
+    # Duty while holding below boiling - a whirlpool or hop stand. Modest on
+    # purpose: a hold replaces standing losses, it does not ramp. Raise it for
+    # a poorly insulated vessel.
+    DEFAULT_HOLD_POWER = 30
     DEFAULT_MAX_OUTPUT = 100
     DEFAULT_SAMPLE_TIME = 5
 
@@ -186,23 +209,103 @@ class BoilPower(CBPiKettleLogic):
             self.DEFAULT_BOIL_POWER,
         )
 
-    def _threshold(self):
-        """Where full power ends and the fixed duty begins, read fresh.
+    @action(
+        "Hold a temperature (whirlpool / hop stand)",
+        [Property.Number(
+            label="Hold_Target", configurable=True,
+            description="Temperature to hold instead of boiling. Must be below "
+                        "the boil point. Clear it to return to boiling.")],
+        # Settable while stopped for the same reason Boil_Power is: the moment
+        # a brewer reaches for this is as the boil ends, and answering "start
+        # the kettle first" at that moment is backwards.
+        allow_stopped=True,
+    )
+    async def set_hold_target(self, Hold_Target=None, **kwargs):
+        """Start or clear a hold, without editing the recipe.
 
-        Read on every pass, not once before the loop. Captured up front, a
-        change to the kettle's setpoint did nothing until the logic was
-        restarted - so the dashboard's temperature slider, which is labelled as
-        the boil threshold, silently had no effect on a running boil. A control
-        that appears to work and does not is worse than one that is absent.
+        A blank value clears the hold and returns to ordinary boiling, which is
+        what makes this usable as a round trip: boil, hold for the stand, clear
+        it. Like the boil power override it is not written to disk - a hop
+        stand is a decision about one batch, and a restart should come back to
+        the configured value.
 
-        The kettle's setpoint wins when there is one, leaving Boil_Threshold as
-        the default it falls back to.
+        Raises on a value it cannot use. Returning a failure here would be
+        invisible: BasicController.call_action returns True unconditionally
+        after awaiting an action and False only if it RAISES, so a refusal
+        expressed as a return value reaches no caller and the dialog closes
+        looking successful.
+        """
+        if Hold_Target is None or str(Hold_Target).strip() == "":
+            self._hold_target_override = None
+            self._tell(
+                getattr(getattr(self, "kettle", None), "name", "Kettle"),
+                "Hold cleared - boiling normally.",
+            )
+            return
 
-        Never raises. The configured value is a free-text property, so it can
-        be anything a brewer types, and a bare float() on it raised out of
-        run() before the heater had even been resolved - which meant both
-        cleanup paths skipped the de-energize and a failed start could leave an
-        already-on element running with no logic behind it.
+        try:
+            target = float(Hold_Target)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "Hold target needs a number, not {!r}. The hold was left "
+                "unchanged.".format(Hold_Target)
+            )
+        if target != target or target in (float("inf"), float("-inf")):
+            raise ValueError(
+                "Hold target needs a finite number, not {!r}.".format(Hold_Target)
+            )
+
+        boiling = self._configured_boiling()
+        drop = self.BOIL_EXIT_DROP_C * (1.0 if self._unit() == "C" else 1.8)
+        if target >= boiling - drop:
+            raise ValueError(
+                "A hold target of {:.1f} is not below the boil point {:.1f}, "
+                "so it would not be a hold. Lower it, or clear it to boil."
+                .format(target, boiling)
+            )
+
+        self._hold_target_override = target
+        self._tell(
+            getattr(getattr(self, "kettle", None), "name", "Kettle"),
+            "Holding {:.1f} at {}% instead of boiling.".format(
+                target, self._hold_power()
+            ),
+        )
+
+    def _hold_power(self):
+        """The duty used while holding below boiling, read fresh each pass.
+
+        Deliberately NOT Max_Output. An earlier version of this branch used
+        full output whenever the reading fell below the hold band, and a test
+        caught it: on a full kettle with a multi-kilowatt element, 100% to
+        close a six degree gap overshoots straight back towards a boil. That is
+        the failure this whole branch exists to prevent, reintroduced one layer
+        down.
+
+        Deliberately not Boil_Power either. That duty is chosen to sustain a
+        rolling boil, which is far more than replacing standing losses at a hop
+        stand.
+
+        A separate knob rather than a derived fraction, because how hard to
+        hold depends on the vessel, its insulation and the element - none of
+        which this plugin can know.
+        """
+        return self._clamp_percent(
+            self.props.get("Hold_Power", self.DEFAULT_HOLD_POWER),
+            self.DEFAULT_HOLD_POWER,
+        )
+
+    def _configured_boiling(self):
+        """What counts as boiling on this rig, ignoring the live setpoint.
+
+        Separate from _threshold() because the two answer different questions.
+        _threshold() asks "what temperature is this run aiming at", and the
+        kettle's setpoint wins there. This asks "where is the boil", which a
+        setpoint must not move - otherwise asking for a 170F hop stand would
+        redefine 170F as boiling, and there would be no way left to tell a hold
+        apart from a boil.
+
+        Never raises: Boil_Threshold is free text and can be anything typed.
         """
         configured = self._default_threshold()
         raw = self.props.get("Boil_Threshold", None)
@@ -221,6 +324,73 @@ class BoilPower(CBPiKettleLogic):
                     "BoilPower: ignoring Boil_Threshold %r, using %.1f",
                     raw, configured,
                 )
+        return configured
+
+    def _hold_target(self, threshold, exit_drop):
+        """The temperature to hold, or None for an ordinary boil.
+
+        Read from an explicit Hold_Target, NOT inferred from the setpoint.
+
+        Inferring it was tried and was wrong. The first version treated any
+        setpoint meaningfully below the configured boiling point as a hop
+        stand, and two existing tests failed - correctly. This logic already
+        documents that the kettle's setpoint IS the boil threshold, which is
+        what lets a brewer at altitude, or anyone wanting a gentler boil, say
+        "my boil is at 205". Reinterpreting that as a bang-bang hold would
+        silently break a legitimate and already-supported use.
+
+        So a hold has to be asked for, not guessed at. An override set through
+        the action wins over the stored property, matching Boil_Power, so a
+        hold can be started and cleared mid-brew without editing the recipe.
+
+        `threshold` and `exit_drop` are still taken because the hold must be
+        below the boil to mean anything; a hold target at or above the boil
+        point is refused rather than silently fighting the boil branch.
+        """
+        override = getattr(self, "_hold_target_override", None)
+        raw = override if override is not None else self.props.get(
+            "Hold_Target", None
+        )
+        if raw is None or raw == "":
+            return None
+        try:
+            target = float(raw)
+        except (TypeError, ValueError):
+            logging.warning("BoilPower: ignoring Hold_Target %r", raw)
+            return None
+        if target != target or target in (float("inf"), float("-inf")):
+            logging.warning("BoilPower: ignoring Hold_Target %r", raw)
+            return None
+        if target <= 0:
+            return None
+        boiling = self._configured_boiling()
+        if target >= boiling - exit_drop:
+            logging.warning(
+                "BoilPower: Hold_Target %.1f is not below the boil point "
+                "%.1f - ignoring it and boiling normally", target, boiling,
+            )
+            return None
+        return target
+
+    def _threshold(self):
+        """Where full power ends and the fixed duty begins, read fresh.
+
+        Read on every pass, not once before the loop. Captured up front, a
+        change to the kettle's setpoint did nothing until the logic was
+        restarted - so the dashboard's temperature slider, which is labelled as
+        the boil threshold, silently had no effect on a running boil. A control
+        that appears to work and does not is worse than one that is absent.
+
+        The kettle's setpoint wins when there is one, leaving Boil_Threshold as
+        the default it falls back to.
+
+        Never raises. The configured value is a free-text property, so it can
+        be anything a brewer types, and a bare float() on it raised out of
+        run() before the heater had even been resolved - which meant both
+        cleanup paths skipped the de-energize and a failed start could leave an
+        already-on element running with no logic behind it.
+        """
+        configured = self._configured_boiling()
         try:
             published = float(self.get_kettle_target_temp(self.id) or 0)
             if published > 0 and published == published:
@@ -560,6 +730,7 @@ class BoilPower(CBPiKettleLogic):
             except Exception:  # noqa: BLE001 - a cosmetic field, never fatal
                 pass
             announced_boil = False
+            announced_hold = False
             # What this loop last commanded, used only when the actor cannot be
             # read. Starts as 0 because the line above just de-energized it.
             commanded = 0
@@ -588,26 +759,73 @@ class BoilPower(CBPiKettleLogic):
                     await clock.sleep(sample_time)
                     continue
 
-                if current_temp >= threshold:
-                    boil_latched = True
-                elif boil_latched and current_temp < threshold - exit_drop:
-                    # Genuinely off the boil - a lid opened, a chiller started,
-                    # or the element failed - so go back to getting it there.
+                # A target set BELOW the boil threshold is a request to hold
+                # that temperature, not to boil - a whirlpool or hop stand.
+                #
+                # Without this the logic is not merely unhelpful, it actively
+                # fights the brewer. Below `threshold - exit_drop` the boil
+                # latch releases and heat_percent reverts to Max_Output, so a
+                # kettle cooled to a 170F hop stand is driven at FULL POWER
+                # back towards a boil. The comment on the latch release names
+                # "a chiller started" as a trigger, which is exactly this case
+                # described and then answered backwards.
+                #
+                # Bang-bang rather than PID: a hop stand wants "do not fall
+                # below the target", not tight regulation, and the vessel's
+                # thermal mass does most of the work. The same band that
+                # decides the wort has come off the boil is reused as the
+                # hysteresis, so there is one notion of "meaningfully below"
+                # in this file rather than two.
+                hold_target = self._hold_target(threshold, exit_drop)
+                if hold_target is not None:
                     boil_latched = False
                     announced_boil = False
-
-                if boil_latched:
-                    heat_percent = self._boil_power()
-                    if not announced_boil:
-                        announced_boil = True
+                    if not announced_hold:
+                        announced_hold = True
                         self._tell(
-                            getattr(self.kettle, "name", "Boil"),
-                            "Boiling at {:.1f}. Holding {}% - adjust from the "
-                            "dashboard.".format(current_temp, heat_percent),
+                            getattr(self.kettle, "name", "Kettle"),
+                            "Holding {:.1f} - below the {:.1f} boil threshold, "
+                            "so this is a hold, not a boil.".format(
+                                hold_target, threshold
+                            ),
                         )
+                    # Heat only when below the band; off at or above target.
+                    # Overshoot on a vessel this size is slow, and a hop stand
+                    # a few degrees high is mild - sitting at full power is not.
+                    if current_temp < hold_target - exit_drop:
+                        heat_percent = self._hold_power()
+                    elif current_temp >= hold_target:
+                        heat_percent = 0
+                    else:
+                        # Inside the band: hold the element where it already is
+                        # rather than chattering it every pass.
+                        heat_percent = commanded or 0
                 else:
-                    heat_percent = max_output
-                    announced_boil = False
+                    announced_hold = False
+
+                    if current_temp >= threshold:
+                        boil_latched = True
+                    elif boil_latched and current_temp < threshold - exit_drop:
+                        # Genuinely off the boil - a lid opened, a chiller
+                        # started, or the element failed - so go back to
+                        # getting it there.
+                        boil_latched = False
+                        announced_boil = False
+
+                    if boil_latched:
+                        heat_percent = self._boil_power()
+                        if not announced_boil:
+                            announced_boil = True
+                            self._tell(
+                                getattr(self.kettle, "name", "Boil"),
+                                "Boiling at {:.1f}. Holding {}% - adjust from "
+                                "the dashboard.".format(
+                                    current_temp, heat_percent
+                                ),
+                            )
+                    else:
+                        heat_percent = max_output
+                        announced_boil = False
 
                 # Drive the actor from what it IS doing, not from what this loop
                 # last told it to do.
