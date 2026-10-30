@@ -27,6 +27,7 @@ on-time, so a PWM actor, an SSR and a contactor each behave as configured.
 
 import asyncio
 import logging
+import math
 import time
 
 from cbpi.api import *
@@ -393,7 +394,13 @@ class BoilPower(CBPiKettleLogic):
         configured = self._configured_boiling()
         try:
             published = float(self.get_kettle_target_temp(self.id) or 0)
-            if published > 0 and published == published:
+            # Finite, not just "not NaN". An infinite setpoint passed the NaN
+            # test and became the boil point, which the wort can never reach:
+            # the boil was never recognised and the element held Max_Output
+            # for good instead of dropping to Boil_Power - 100% where no
+            # setpoint gives 85% (cbpi-testbench test_safety_invariants, I5).
+            # Neither can be a boil point, so both mean "no setpoint".
+            if published > 0 and math.isfinite(published):
                 return published
         except Exception:  # noqa: BLE001
             # Broad on purpose. This calls out into the core, and the core
