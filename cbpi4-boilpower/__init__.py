@@ -82,7 +82,10 @@ except ImportError:  # pragma: no cover - depends on the host installation
                     "This is deliberately separate from the kettle setpoint, "
                     "because the setpoint already means 'where my boil is' - "
                     "which is how a lower-temperature or high-altitude boil is "
-                    "expressed. Settable mid-brew from the dashboard."),
+                    "expressed. Settable mid-brew from the dashboard with Hold "
+                    "a temperature, which keeps it here until it is cleared. "
+                    "A Boil step in the mash profile clears it: a Boil step "
+                    "means boil."),
     Property.Number(
         label="Hold_Power", configurable=True, default_value=30,
         description="Element duty while holding a setpoint BELOW boiling - a "
@@ -226,9 +229,21 @@ class BoilPower(CBPiKettleLogic):
 
         A blank value clears the hold and returns to ordinary boiling, which is
         what makes this usable as a round trip: boil, hold for the stand, clear
-        it. Like the boil power override it is not written to disk - a hop
-        stand is a decision about one batch, and a restart should come back to
-        the configured value.
+        it.
+
+        Kept with the kettle, in its Hold_Target setting, until it is cleared -
+        as Set boil power keeps Boil_Power. It used to be kept only on the
+        logic it was given to, and switching a kettle on builds a new logic: a
+        hold asked for while the kettle was off was accepted, and then the
+        kettle boiled at full power - 100% at 180 F in the 2 Nov review of the
+        recipe flow (GPT's G3). Stop and Start, or a restart, lost a running
+        hold the same way. Kept with the kettle, the logic switched on next
+        reads it, and the hold dialog, which opens on the kettle's setting,
+        shows the hold in force.
+
+        A Boil step in the mash profile clears it (_clear_hold_for_boil), so a
+        hold left from one brew's hop stand never turns a later boil into a
+        hold; and a hold cannot be set while a Boil step is boiling this kettle.
 
         Raises on a value it cannot use. Returning a failure here would be
         invisible: BasicController.call_action returns True unconditionally
@@ -236,13 +251,26 @@ class BoilPower(CBPiKettleLogic):
         expressed as a return value reaches no caller and the dialog closes
         looking successful.
         """
+        name = self._kettle_name()
+        running = bool(getattr(self, "running", False))
         if Hold_Target is None or str(Hold_Target).strip() == "":
             self._hold_target_override = None
+            await self._keep_hold(None)
             self._tell(
-                getattr(getattr(self, "kettle", None), "name", "Kettle"),
-                "Hold cleared - boiling normally.",
+                name,
+                "Hold cleared - boiling normally." if running
+                else "Hold cleared: {} boils when it is switched on.".format(name),
             )
             return
+
+        boil_step = self._boil_step_on_this_kettle()
+        if boil_step is not None:
+            message = (
+                "'{}' is boiling {}, so no hold was set. Hold a temperature "
+                "once the boil has finished.".format(boil_step, name)
+            )
+            self._tell(name, message, NotificationType.WARNING)
+            raise ValueError(message)
 
         try:
             target = float(Hold_Target)
@@ -266,11 +294,109 @@ class BoilPower(CBPiKettleLogic):
             )
 
         self._hold_target_override = target
+        await self._keep_hold(target)
+        if running:
+            self._tell(
+                name,
+                "Holding {:.1f} at {}% instead of boiling.".format(
+                    target, self._hold_power()
+                ),
+            )
+        else:
+            self._tell(
+                name,
+                "Hold {:.1f} set: switched on, {} holds it at {}% instead of "
+                "boiling.".format(target, name, self._hold_power()),
+            )
+
+    def _kettle_name(self):
+        """This kettle's name, for the brewer. Never raises.
+
+        self.kettle is only set once run() starts, and an action can reach a
+        logic that never ran - a stopped kettle's - so it is looked up.
+        """
+        kettle = getattr(self, "kettle", None)
+        if kettle is None:
+            try:
+                kettle = self.get_kettle(self.id)
+            except Exception:  # noqa: BLE001
+                kettle = None
+        return getattr(kettle, "name", None) or "Boil kettle"
+
+    def _hold_raw(self):
+        """The hold asked for, as given, or None: the override, else the
+        kettle's Hold_Target setting. Blank is none."""
+        override = getattr(self, "_hold_target_override", None)
+        if override is not None:
+            raw = override
+        else:
+            try:
+                raw = self.props.get("Hold_Target", None)
+            except Exception:  # noqa: BLE001
+                raw = None
+        if raw is None or str(raw).strip() == "":
+            return None
+        return raw
+
+    async def _keep_hold(self, target):
+        """Keep the hold with the kettle, on disk: its Hold_Target setting,
+        blank for none. Never raises - the hold is applied either way."""
+        value = "" if target is None else target
+        try:
+            self.props["Hold_Target"] = value
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            kettle = self.get_kettle(self.id)
+            props = getattr(kettle, "props", None)
+            if props is not None and props is not self.props:
+                props["Hold_Target"] = value
+            await self.cbpi.kettle.save()
+        except Exception as e:  # noqa: BLE001 - never fail an action on this
+            logging.warning("BoilPower: could not keep the hold with the kettle: %s", e)
+
+    def _boil_step_on_this_kettle(self):
+        """The name of the mash profile's running Boil step, if it boils this
+        kettle - else None. Never raises.
+
+        A Boil step means boil. Asked of the profile itself rather than told by
+        the step, so it holds on any CraftBeerPi, and for a logic that was
+        already running when the step started.
+        """
+        try:
+            find = getattr(getattr(self.cbpi, "step", None), "find_by_status", None)
+            if find is None:
+                return None
+            from cbpi.api.step import StepState
+            active = find(StepState.ACTIVE)
+            if active is None or getattr(active, "type", None) != "BoilStep":
+                return None
+            props = getattr(active, "props", None)
+            if props is None or props.get("Kettle", None) != self.id:
+                return None
+            return getattr(active, "name", None) or "The Boil step"
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _clear_hold_for_boil(self, boil_step):
+        """Drop the hold: the mash profile's Boil step is boiling this kettle.
+
+        Without this a hold is in force until the brewer clears it, and one
+        left from a hop stand would turn the next brew's boil into a hold at
+        hop-stand temperature. Cleared from the kettle as well, and said, so
+        the brewer knows why it has gone.
+        """
+        held = self._hold_raw()
+        self._hold_target_override = None
+        await self._keep_hold(None)
+        try:
+            shown = "{:.1f}".format(float(held))
+        except (TypeError, ValueError):
+            shown = str(held)
         self._tell(
-            getattr(getattr(self, "kettle", None), "name", "Kettle"),
-            "Holding {:.1f} at {}% instead of boiling.".format(
-                target, self._hold_power()
-            ),
+            self._kettle_name(),
+            "Hold {} cleared: '{}' is boiling it. Set a hold again, with Hold "
+            "a temperature, once the boil has finished.".format(shown, boil_step),
         )
 
     def _hold_power(self):
@@ -783,6 +909,13 @@ class BoilPower(CBPiKettleLogic):
                 # decides the wort has come off the boil is reused as the
                 # hysteresis, so there is one notion of "meaningfully below"
                 # in this file rather than two.
+                # A Boil step in the mash profile means boil. A hold still in
+                # force - from this brew's hop stand or an earlier one's - is
+                # dropped before it can turn the boil into a hold.
+                boil_step = self._boil_step_on_this_kettle()
+                if boil_step is not None and self._hold_raw() is not None:
+                    await self._clear_hold_for_boil(boil_step)
+
                 hold_target = self._hold_target(threshold, exit_drop)
                 if hold_target is not None:
                     boil_latched = False
@@ -792,7 +925,8 @@ class BoilPower(CBPiKettleLogic):
                         self._tell(
                             getattr(self.kettle, "name", "Kettle"),
                             "Holding {:.1f} - below the {:.1f} boil threshold, "
-                            "so this is a hold, not a boil.".format(
+                            "so this is a hold, not a boil. To boil, clear it "
+                            "with Hold a temperature.".format(
                                 hold_target, threshold
                             ),
                         )
