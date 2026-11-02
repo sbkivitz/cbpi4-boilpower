@@ -180,6 +180,26 @@ Set it to your boiling point — around **210 °F / 99 °C**, adjusted for
 altitude. A low setpoint means the kettle latches "boiling" almost immediately
 and drops to the holding duty long before the wort is hot.
 
+## Holding below the boil: whirlpool or hop stand
+
+The **Hold a temperature** action holds the wort at a temperature below the
+boil, for example 170 °F, instead of boiling it. It heats at `Hold_Power` only
+when the wort falls more than 2 °C / 3.6 °F below the target, and it switches
+off at or above the target. Leave the field blank to clear it and boil again.
+
+- The hold is saved in the kettle's `Hold_Target` setting and stays in force
+  until you clear it. So you can set it while the kettle is off, then switch
+  the kettle on, and the kettle holds rather than boils. Stop and Start, or a
+  restart, keep it too. The dialog opens showing the hold in force.
+- A **Boil step** in the mash profile clears it. A hold left from one brew's
+  hop stand would otherwise turn the next brew's boil into a hold. A hold
+  can't be set while a Boil step is boiling the kettle: set it once the boil
+  has finished.
+
+Until 0.0.3.post2 the hold was kept only by the running logic, so a hold set
+while the kettle was off was lost when it was switched on, and the kettle
+boiled at full power.
+
 ## Properties
 
 | Property | Default | Meaning |
@@ -187,6 +207,8 @@ and drops to the holding duty long before the wort is hot.
 | `Boil_Threshold` | 99 °C / 210.2 °F | Where full power ends and fixed duty begins |
 | `Boil_Power` | 85 | Element duty once boiling, 0–100 % |
 | `Max_Output` | 100 | Element duty while heating up |
+| `Hold_Target` | blank | Temperature to hold instead of boiling; blank boils |
+| `Hold_Power` | 30 | Element duty while holding below the boil, 0–100 % |
 | `SampleTime` | 5 | Seconds between control decisions |
 
 Temperature defaults are authored in Celsius and converted, so a bare number is
