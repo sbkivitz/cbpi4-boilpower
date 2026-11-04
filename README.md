@@ -189,16 +189,21 @@ off at or above the target. Leave the field blank to clear it and boil again.
 
 - The hold is saved in the kettle's `Hold_Target` setting and stays in force
   until you clear it. So you can set it while the kettle is off, then switch
-  the kettle on, and the kettle holds rather than boils. Stop and Start, or a
-  restart, keep it too. The dialog opens showing the hold in force.
+  the kettle on, and the kettle holds rather than boils. Stop and Start keep
+  it too. The dialog opens showing the hold in force.
 - A **Boil step** in the mash profile clears it. A hold left from one brew's
   hop stand would otherwise turn the next brew's boil into a hold. A hold
   can't be set while a Boil step is boiling the kettle: set it once the boil
   has finished.
+- A **restart** of CraftBeerPi clears it, power cut or not. A message then
+  says which hold was cleared, and stays until you press OK, so a page you
+  open after the restart shows it too. Switched on after a restart, the kettle
+  heats to a boil until you set the hold again.
 
 Until 0.0.3.post2 the hold was kept only by the running logic, so a hold set
 while the kettle was off was lost when it was switched on, and the kettle
-boiled at full power.
+boiled at full power. In 0.0.3.post2 a restart kept the hold; from 0.0.3.post3
+it clears it.
 
 ## Properties
 
