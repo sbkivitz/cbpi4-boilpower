@@ -26,12 +26,13 @@ on-time, so a PWM actor, an SSR and a contactor each behave as configured.
 """
 
 import asyncio
+import inspect
 import logging
 import math
 import time
 
 from cbpi.api import *
-from cbpi.api.dataclasses import NotificationType
+from cbpi.api.dataclasses import NotificationAction, NotificationType
 
 try:
     # Present on forks with a pluggable clock, which lets a whole brew day be
@@ -85,7 +86,7 @@ except ImportError:  # pragma: no cover - depends on the host installation
                     "expressed. Settable mid-brew from the dashboard with Hold "
                     "a temperature, which keeps it here until it is cleared. "
                     "A Boil step in the mash profile clears it: a Boil step "
-                    "means boil."),
+                    "means boil. So does a restart of CraftBeerPi."),
     Property.Number(
         label="Hold_Power", configurable=True, default_value=30,
         description="Element duty while holding a setpoint BELOW boiling - a "
@@ -236,14 +237,16 @@ class BoilPower(CBPiKettleLogic):
         logic it was given to, and switching a kettle on builds a new logic: a
         hold asked for while the kettle was off was accepted, and then the
         kettle boiled at full power - 100% at 180 F in the 2 Nov review of the
-        recipe flow (GPT's G3). Stop and Start, or a restart, lost a running
-        hold the same way. Kept with the kettle, the logic switched on next
-        reads it, and the hold dialog, which opens on the kettle's setting,
-        shows the hold in force.
+        recipe flow (GPT's G3). Stop and Start lost a running hold the same
+        way. Kept with the kettle, the logic switched on next reads it, and the
+        hold dialog, which opens on the kettle's setting, shows the hold in
+        force.
 
         A Boil step in the mash profile clears it (_clear_hold_for_boil), so a
         hold left from one brew's hop stand never turns a later boil into a
         hold; and a hold cannot be set while a Boil step is boiling this kettle.
+        A restart of CraftBeerPi clears it too, and says so
+        (_clear_holds_after_restart).
 
         Raises on a value it cannot use. Returning a failure here would be
         invisible: BasicController.call_action returns True unconditionally
@@ -1033,6 +1036,118 @@ class BoilPower(CBPiKettleLogic):
                 await self.actor_off(heater)
 
 
+def _hold_in(settings):
+    """The hold kept in `settings` - a kettle's props, or the BoilPower
+    settings a kettle put aside for another logic - or None. Blank is none."""
+    try:
+        raw = settings.get("Hold_Target", None)
+    except Exception:  # noqa: BLE001
+        return None
+    if raw is None or str(raw).strip() == "":
+        return None
+    return raw
+
+
+def _clear_kettle_hold(kettle):
+    """Clear the hold kept with `kettle`.
+
+    (the hold that was in force or None, whether anything was cleared)."""
+    in_force, cleared = None, False
+    if getattr(kettle, "type", None) == "BoilPower":
+        props = getattr(kettle, "props", None)
+        if props is not None and _hold_in(props) is not None:
+            in_force = _hold_in(props)
+            props["Hold_Target"] = ""
+            cleared = True
+        # Kettles start switched off, so there is normally no logic yet.
+        logic = getattr(kettle, "instance", None)
+        if logic is not None:
+            logic._hold_target_override = None
+            logic_props = getattr(logic, "props", None)
+            if logic_props is not None and logic_props is not props:
+                logic_props["Hold_Target"] = ""
+    # Put aside while the kettle runs another logic: switching back to
+    # BoilPower would bring it back.
+    aside = (getattr(kettle, "props_by_type", None) or {}).get("BoilPower")
+    if isinstance(aside, dict) and _hold_in(aside) is not None:
+        aside["Hold_Target"] = ""
+        cleared = True
+        logging.info("BoilPower: cleared the hold put aside on %s",
+                     getattr(kettle, "name", "a kettle"))
+    return in_force, cleared
+
+
+def _tell_hold_cleared(cbpi, kettle_name, held):
+    """Tell the brewer the restart cleared a hold - in a prompt kept until
+    it is acknowledged, where CraftBeerPi can keep one, so a page opened
+    after the restart shows it."""
+    try:
+        shown = "{:.1f}".format(float(held))
+    except (TypeError, ValueError):
+        shown = str(held)
+    try:
+        unit = " °F" if str(cbpi.config.get("TEMP_UNIT", "C")).upper() == "F" else " °C"
+    except Exception:  # noqa: BLE001
+        unit = ""
+    message = (
+        "CraftBeerPi restarted, and that cleared the hold at {}{}. Switched on "
+        "now, {} heats to a boil. To hold again, use Hold a temperature."
+        .format(shown, unit, kettle_name)
+    )
+    logging.warning("%s: %s", kettle_name, message)
+    try:
+        kept = "keep" in inspect.signature(cbpi.notify).parameters
+    except (TypeError, ValueError):
+        kept = False
+    try:
+        options = dict(keep=True) if kept else {}
+        cbpi.notify(kettle_name, message, NotificationType.WARNING,
+                    action=[NotificationAction("OK")], **options)
+    except Exception as e:  # noqa: BLE001
+        logging.warning("BoilPower: could not say the hold was cleared: %s", e)
+
+
+async def _clear_holds_after_restart(cbpi):
+    """A restart of CraftBeerPi clears every BoilPower hold, and says so.
+
+    Scott, 3 Nov: "Restarts should clear the hold." A hold is kept with the
+    kettle so that switching the kettle off and on keeps it (0.0.3.post2). A
+    restart is different: the server may have been down for minutes or a
+    night, and a hold left in the kettle's settings waits for the next time the
+    kettle is switched on - perhaps the next brew. So a restart clears it, and
+    the brewer is told which hold went, in time to set it again.
+
+    A start-up hook: run once everything is loaded, before any page can
+    connect. Never raises - a hook that raised would stop CraftBeerPi starting.
+    """
+    try:
+        told, changed = [], False
+        for kettle in list(getattr(cbpi.kettle, "data", None) or []):
+            try:
+                held, cleared = _clear_kettle_hold(kettle)
+            except Exception as e:  # noqa: BLE001
+                logging.warning("BoilPower: could not clear the hold on %s: %s",
+                                getattr(kettle, "name", "a kettle"), e)
+                continue
+            changed = changed or cleared
+            if held is not None:
+                told.append((getattr(kettle, "name", None) or "Boil kettle", held))
+        if changed:
+            await cbpi.kettle.save()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("BoilPower: could not clear holds after the restart: %s", e)
+        return
+    for kettle_name, held in told:
+        _tell_hold_cleared(cbpi, kettle_name, held)
+
+
 def setup(cbpi):
     cbpi.plugin.register("BoilPower", BoilPower)
+    try:
+        async def clear_holds(app):
+            await _clear_holds_after_restart(cbpi)
+
+        cbpi.app.on_startup.append(clear_holds)
+    except Exception as e:  # noqa: BLE001
+        logging.warning("BoilPower: a restart will not clear holds: %s", e)
 
