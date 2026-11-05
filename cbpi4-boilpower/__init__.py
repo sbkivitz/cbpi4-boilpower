@@ -90,13 +90,13 @@ except ImportError:  # pragma: no cover - depends on the host installation
     Property.Number(
         label="Hold_Power", configurable=True, default_value=30,
         description="Element duty while holding a setpoint BELOW boiling - a "
-                    "whirlpool or hop stand. Set the kettle target below the "
-                    "boil threshold and this logic holds it with on/off "
-                    "control at this duty instead of boiling. Modest on "
-                    "purpose: a hold replaces standing losses, and full power "
-                    "near the target overshoots. More than 4 C / 7.2 F below "
-                    "the hold, it climbs at Max_Output first. Raise it for a "
-                    "poorly insulated vessel."),
+                    "whirlpool or hop stand - once the wort reaches it. Set "
+                    "the kettle target below the boil threshold and this "
+                    "logic holds it instead of boiling. Modest on purpose: a "
+                    "hold replaces standing losses, and full power near the "
+                    "target overshoots. More than 4 C / 7.2 F below the hold "
+                    "it heats at Max_Output, easing to this as it nears the "
+                    "hold. Raise it for a poorly insulated vessel."),
     Property.Select(
         label="SampleTime", options=[2, 5],
         description="Seconds between control decisions. Matches PIDBoil."),
@@ -138,19 +138,21 @@ class BoilPower(CBPiKettleLogic):
     BOIL_EXIT_DROP_C = 2.0
 
     # How far below a hold the wort must be for the hold to climb back at
-    # Max_Output, before topping up at Hold_Power within this of the target.
+    # Max_Output. Within this of the target it eases off in proportion, down
+    # to Hold_Power at the target (_hold_climb_power).
     #
     # Scott, 4 Nov, on a whirlpool that had cooled too far: "I'd like a prompt
     # to ask if I want to raise temp back to whirlpool temp and hold". Hold_Power
     # replaces standing losses; it does not climb. On the simulator's boil
     # kettle - 5.5 kW, 40 litres, losing about 1.4 kW at 170 F - 30% would
     # take about an hour to climb back from 158 F, longer than the stand; full
-    # power takes about five minutes.
+    # power takes about five minutes. And then, of the flat 30% that took over
+    # 7.2 F short: "I should not be forced to use the hold_power value".
     #
-    # Never full power near the target: within this of it the hold is the
-    # gentle one it always was, so the element's heat and the probe's lag
-    # carry the wort a few degrees on, not past the hold - let alone back to
-    # a boil (see _hold_power).
+    # Never full power near the target: within this of it the power falls
+    # away as the wort closes in, and at the hold it is the gentle Hold_Power
+    # it always was, so the element's heat and the probe's lag carry the wort
+    # no further past the hold than before - let alone back to a boil.
     HOLD_CLIMB_C = 4.0
 
     def _unit(self):
@@ -424,7 +426,7 @@ class BoilPower(CBPiKettleLogic):
         )
 
     def _hold_power(self):
-        """The duty used while holding below boiling, read fresh each pass.
+        """The duty a hold settles to at its target, read fresh each pass.
 
         Not Max_Output near the target. An earlier version of this branch used
         full output whenever the reading fell below the hold band, and a test
@@ -432,7 +434,8 @@ class BoilPower(CBPiKettleLogic):
         close a six degree gap overshoots straight back towards a boil. That is
         the failure this whole branch exists to prevent, reintroduced one layer
         down. Full output is used only to climb from well below the hold
-        (HOLD_CLIMB_C), and stops that far short of it.
+        (HOLD_CLIMB_C); from there the duty eases down to this one at the
+        target (_hold_climb_power).
 
         Deliberately not Boil_Power either. That duty is chosen to sustain a
         rolling boil, which is far more than replacing standing losses at a hop
@@ -446,6 +449,25 @@ class BoilPower(CBPiKettleLogic):
             self.props.get("Hold_Power", self.DEFAULT_HOLD_POWER),
             self.DEFAULT_HOLD_POWER,
         )
+
+    def _hold_climb_power(self, below, climb_band, max_output):
+        """The duty for wort `below` the hold, within climb_band of it.
+
+        In proportion: Max_Output at climb_band below, easing to Hold_Power at
+        the hold. Scott, 4 Nov, of a whirlpool cooled too far: "if I'm
+        attempting to heat back up from where I over-cooled, I should not be
+        forced to use the hold_power value". A flat Hold_Power from 7.2 F
+        below only just beat the losses, and on the simulator's kettle the
+        last 5 F took most of a 20 minute stand.
+
+        Proportional, like the P of a PID, with no settings of its own to tune.
+        Truncated, so it never reaches Max_Output inside the band. At the hold
+        it is Hold_Power, as it always was, so it carries the wort no further
+        past it than before.
+        """
+        hold = self._hold_power()
+        share = min(1.0, max(0.0, below / climb_band)) if climb_band > 0 else 1.0
+        return int(hold + (max_output - hold) * share)
 
     def _configured_boiling(self):
         """What counts as boiling on this rig, ignoring the live setpoint.
@@ -950,33 +972,37 @@ class BoilPower(CBPiKettleLogic):
                         announced_hold = True
                         self._tell(
                             getattr(self.kettle, "name", "Kettle"),
-                            "Holding {:.1f} instead of boiling: it heats at {}% "
-                            "once the wort is {:.1f} below, and at {}% while it "
-                            "is more than {:.1f} below. To boil, clear it with "
-                            "Hold a temperature.".format(
-                                hold_target, self._hold_power(), exit_drop,
-                                max_output, climb_band,
+                            "Holding {:.1f} instead of boiling. Below it, it heats "
+                            "at {}% while the wort is more than {:.1f} below, "
+                            "easing to {}% as it reaches the hold; then it rests "
+                            "until the wort is {:.1f} below. To boil, clear it "
+                            "with Hold a temperature.".format(
+                                hold_target, max_output, climb_band,
+                                self._hold_power(), exit_drop,
                             ),
                         )
                     # Heat only when below the band; off at or above target.
                     # Overshoot on a vessel this size is slow, and a hop stand
                     # a few degrees high is mild - sitting at full power is not.
                     # Far below, climb at full power to within climb_band
-                    # first (HOLD_CLIMB_C): Hold_Power alone barely beats the
-                    # losses of a kettle that has cooled well past the hold.
-                    if current_temp < hold_target - climb_band:
+                    # first (HOLD_CLIMB_C); within it, ease off in proportion
+                    # to how far below the wort still is, down to Hold_Power
+                    # at the hold (_hold_climb_power). Hold_Power alone
+                    # barely beats the losses of a kettle that has cooled well
+                    # past the hold, and the last few degrees crawled.
+                    below = hold_target - current_temp
+                    if below >= climb_band:
                         heat_percent = max_output
-                    elif current_temp < hold_target - exit_drop:
-                        heat_percent = self._hold_power()
-                    elif current_temp >= hold_target:
+                    elif below <= 0:
                         heat_percent = 0
+                    elif below > exit_drop or (commanded or 0) > 0:
+                        # Below the band, or inside it and still heating:
+                        # carry on, rather than chattering the element every
+                        # pass - eased, never at a climb's full power, even if
+                        # the wort crossed both bands between two readings.
+                        heat_percent = self._hold_climb_power(below, climb_band, max_output)
                     else:
-                        # Inside the band: carry on heating, or stay off,
-                        # rather than chattering the element every pass - at
-                        # Hold_Power, never at a climb's full power, even if
-                        # the wort crossed the climb and hold bands between two
-                        # readings.
-                        heat_percent = self._hold_power() if (commanded or 0) > 0 else 0
+                        heat_percent = 0
                 else:
                     announced_hold = False
 
