@@ -220,6 +220,13 @@ CraftBeerPi's **WhirlpoolStep** (cbpi4 4.7.7.post27) uses this hold. If the
 wort cools too far during the stand, it asks whether to heat back and hold,
 and when the stand ends it switches the kettle off and clears the hold.
 
+A step like that sets and clears the hold with `Quiet` (from 0.0.3.post5), so
+this plugin says nothing and the step says what happened in its own words:
+"Stand over: Boil Kettle is off and no longer holding 170 °F". Before, the end
+of a stand showed "Hold cleared: Boil Kettle boils when it is switched on",
+which read as if the kettle were about to boil as the chill began. The
+dashboard dialog doesn't offer `Quiet`, and a refused hold still warns.
+
 ## Properties
 
 | Property | Default | Meaning |

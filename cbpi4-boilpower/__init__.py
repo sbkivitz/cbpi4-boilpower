@@ -241,12 +241,18 @@ class BoilPower(CBPiKettleLogic):
         # the kettle first" at that moment is backwards.
         allow_stopped=True,
     )
-    async def set_hold_target(self, Hold_Target=None, **kwargs):
+    async def set_hold_target(self, Hold_Target=None, Quiet=None, **kwargs):
         """Start or clear a hold, without editing the recipe.
 
         A blank value clears the hold and returns to ordinary boiling, which is
         what makes this usable as a round trip: boil, hold for the stand, clear
         it.
+
+        Quiet, for a caller that is not the brewer's dialog - a whirlpool step -
+        sets or clears without the message, so the caller can say why in its
+        own words. Not in the dialog. Scott, 4 Nov: at the end of a stand this
+        said "Hold cleared: Boil Kettle boils when it is switched on", as the
+        chill began. Refusals still warn and raise.
 
         Kept with the kettle, in its Hold_Target setting, until it is cleared -
         as Set boil power keeps Boil_Power. It used to be kept only on the
@@ -272,14 +278,16 @@ class BoilPower(CBPiKettleLogic):
         """
         name = self._kettle_name()
         running = bool(getattr(self, "running", False))
+        quiet = Quiet is True or str(Quiet).strip().lower() in ("yes", "true", "1")
         if Hold_Target is None or str(Hold_Target).strip() == "":
             self._hold_target_override = None
             await self._keep_hold(None)
-            self._tell(
-                name,
-                "Hold cleared - boiling normally." if running
-                else "Hold cleared: {} boils when it is switched on.".format(name),
-            )
+            if not quiet:
+                self._tell(
+                    name,
+                    "Hold cleared - boiling normally." if running
+                    else "Hold cleared: {} boils when it is switched on.".format(name),
+                )
             return
 
         boil_step = self._boil_step_on_this_kettle()
@@ -314,6 +322,8 @@ class BoilPower(CBPiKettleLogic):
 
         self._hold_target_override = target
         await self._keep_hold(target)
+        if quiet:
+            return
         if running:
             self._tell(name, "Holding {:.1f} instead of boiling.".format(target))
         else:
