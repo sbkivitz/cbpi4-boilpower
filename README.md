@@ -183,19 +183,22 @@ and drops to the holding duty long before the wort is hot.
 ## Holding below the boil: whirlpool or hop stand
 
 The **Hold a temperature** action holds the wort at a temperature below the
-boil, for example 170 °F, instead of boiling it. It heats at `Hold_Power` only
-when the wort falls more than 2 °C / 3.6 °F below the target, and it switches
-off at or above the target. Leave the field blank to clear it and boil again.
+boil, for example 170 °F, instead of boiling it. Below the target it heats, and
+at the target it switches off. Once there, it rests until the wort falls more
+than 2 °C / 3.6 °F below, then heats again. Leave the field blank to clear it
+and boil again.
 
-If the wort is more than 4 °C / 7.2 °F below the hold, for example a whirlpool
-that cooled too far, it first climbs at `Max_Output`, then holds at
-`Hold_Power` from 7.2 °F below. `Hold_Power` alone only just beats a kettle's
-losses at whirlpool temperatures: on a simulated 40 litre kettle with a 5500 W
-element, 30% would take about an hour to climb back from 158 °F to 170 °F.
-Full power gets it to 163 °F in about three minutes. It never runs at full
-power within 7.2 °F of the hold, so it doesn't overshoot. How quickly the last
-few degrees come back depends on `Hold_Power`: raise it if your kettle loses a
-lot of heat.
+How hard it heats depends on how far below the target the wort is. More than
+4 °C / 7.2 °F below, for example a whirlpool that cooled too far, it heats at
+`Max_Output`. Closer than that, the power eases off in proportion and reaches
+`Hold_Power` at the target. With the defaults (100% and 30%) it heats at 98%
+7 °F short, 68% 4 °F short and 39% 1 °F short. That's what the P part of a PID
+does, with no settings of its own to tune. On a simulated 40 litre kettle with
+a 5500 W element, heating back from 156 °F reached 168 °F in about 5½ minutes
+and 170 °F in about 9, without going past 170 °F. It never runs at full power
+within 7.2 °F of the hold, and at the target it is at `Hold_Power`, so it
+carries the wort no further past the hold than a flat `Hold_Power` did. Raise
+`Hold_Power` if your kettle loses a lot of heat.
 
 - The hold is saved in the kettle's `Hold_Target` setting and stays in force
   until you clear it. So you can set it while the kettle is off, then switch
@@ -214,7 +217,12 @@ Until 0.0.3.post2 the hold was kept only by the running logic, so a hold set
 while the kettle was off was lost when it was switched on, and the kettle
 boiled at full power. In 0.0.3.post2 a restart kept the hold; from 0.0.3.post3
 it clears it. Until 0.0.3.post4 a hold never climbed: far below its target it
-heated at `Hold_Power` too.
+heated at `Hold_Power` too. Until 0.0.3.post6 it dropped to a flat
+`Hold_Power` 7.2 °F short of the target, which only just beats a kettle's
+losses, so the last few degrees crawled: on the simulated kettle above it
+never got past 168 °F in a 20 minute stand. Scott, 4 Nov: "I don't think if
+I'm attempting to heat back up from where I over-cooled, I should be forced to
+use the hold_power value".
 
 CraftBeerPi's **WhirlpoolStep** (cbpi4 4.7.7.post27) uses this hold. If the
 wort cools too far during the stand, it asks whether to heat back and hold,
@@ -235,7 +243,7 @@ dashboard dialog doesn't offer `Quiet`, and a refused hold still warns.
 | `Boil_Power` | 85 | Element duty once boiling, 0–100 % |
 | `Max_Output` | 100 | Element duty while heating up |
 | `Hold_Target` | blank | Temperature to hold instead of boiling; blank boils |
-| `Hold_Power` | 30 | Element duty while holding below the boil, 0–100 % |
+| `Hold_Power` | 30 | Element duty a hold settles to at its target, 0–100 %; below, it eases up towards `Max_Output` |
 | `SampleTime` | 5 | Seconds between control decisions |
 
 Temperature defaults are authored in Celsius and converted, so a bare number is
