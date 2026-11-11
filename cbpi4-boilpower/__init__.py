@@ -1,12 +1,27 @@
-"""Full power to the boil, then a fixed duty the brewer sets from the dashboard.
+"""Full power to the boil, then a fixed duty the brewer sets from the dashboard;
+or, given a target below the boil, hold it there.
 
 A boil does not need a PID. Once wort is boiling its temperature stops being a
 control variable - it sits at the boiling point whatever you do - and the only
 thing left to choose is how hard it boils. PIDBoil models this as a special
 case at the end of a PID; this plugin is that case on its own:
 
-    below the threshold   ->  Max_Output, get there
-    at or above it        ->  Boil_Power, hold that duty
+    below the boil point (Boil_Threshold)   ->  Max_Output, get there
+    at or above it                          ->  Boil_Power, hold that duty
+
+The kettle's target says which job it has, as on any kettle (Scott, 10 Nov:
+"Set the boil kettle's target to 170 F, like the HLT, and it holds there"):
+
+    no target, or one at the boil   ->  boil, as above
+    a target below the boil         ->  hold it: a whirlpool, a hop stand,
+                                        warm water
+
+"At the boil" is within BOIL_EXIT_DROP_C of Boil_Threshold or above, so a Boil
+step's 210 F or 212 F means boil wherever the threshold sits. Boil_Threshold is
+the one place the boil point is set - at altitude, set it to where your wort
+boils - and the kettle's target no longer moves it. Until 0.0.3.post7 the
+target WAS the boil point, and a hold was a separate Hold_Target setting; that
+is gone, and a restart clears one left in a kettle's settings.
 
 The duty is adjustable while the boil runs, through the Set Boil Power action,
 because the alternative is unusable. Editing a kettle property calls
@@ -15,7 +30,13 @@ autostart False - never restarts. Verified on a live rig: changing the power
 property mid-boil left state=False with the element de-energized, the new value
 saved and doing nothing, and no warning. An action dispatches straight to the
 running logic and never touches update(), so vigour changes without the boil
-being interrupted.
+being interrupted. The same goes for Keep it at the boil, Pause the heat and
+Boil at: each is an action for the same reason.
+
+Every action declares exactly one parameter, named for the setting it keeps,
+and is a no-op given the value in force. The old dashboard's Set Target Temp
+dialog sends every action a logic declares, each seeded with its value in
+force, every time Set is pressed.
 
 Timing deliberately matches PIDBoil rather than inventing its own. The loop
 runs on SampleTime and hands the percentage to the actor exactly as PIDBoil
@@ -62,44 +83,70 @@ except ImportError:  # pragma: no cover - depends on the host installation
     clock = _RealClock()
 
 
+#: The forgotten-pause warning (BoilPower.PAUSE_WARN_AFTER_S): a title and its
+#: message, in the dashboard agent's words, after "HLT pump still running".
+#: Kept on every page until OK, or until the heat carries on or AUTO stops. No
+#: button heats: on the brew-day screen heat only comes on with a held press,
+#: on the element button, which reads PAUSED while the heat is paused.
+PAUSE_FORGOTTEN_TITLE = "{kettle} heat still paused"
+PAUSE_FORGOTTEN_TEXT = (
+    "The heat has been paused for {minutes} minutes. To heat again, press and "
+    "hold PAUSED on the {kettle}."
+)
+
+
+def _notify_kept(cbpi, title, message, type, action):
+    """notify(..., keep=True) where CraftBeerPi can keep a prompt for every
+    page, plain notify where it cannot. -> the notification's id, if any."""
+    try:
+        keeps = "keep" in inspect.signature(cbpi.notify).parameters
+    except (TypeError, ValueError):
+        keeps = False
+    if keeps:
+        return cbpi.notify(title, message, type, action=action, keep=True)
+    return cbpi.notify(title, message, type, action=action)
+
+
 
 @parameters([
     Property.Number(
         label="Boil_Threshold", configurable=True,
-        description="Temperature at which the boil starts and the element drops "
-                    "to Boil_Power. Default 99 C / 210.2 F."),
+        description="Where this kettle boils: full power below it, Boil_Power "
+                    "from it. Default 99 C / 210.2 F. At altitude, set it to "
+                    "where your wort boils. A target within 2 C / 3.6 F of it, "
+                    "or above, means boil; one further below means hold."),
     Property.Number(
         label="Boil_Power", configurable=True, default_value=85,
         description="Element duty once boiling, 0-100%. Adjustable from the "
                     "dashboard while the boil runs."),
     Property.Number(
         label="Max_Output", configurable=True, default_value=100,
-        description="Element duty while heating up to the threshold."),
-    Property.Number(
-        label="Hold_Target", configurable=True,
-        description="Temperature to HOLD instead of boiling - a whirlpool or "
-                    "hop stand. Leave blank for an ordinary boil. Must be "
-                    "below the boil point; a value at or above it is ignored. "
-                    "This is deliberately separate from the kettle setpoint, "
-                    "because the setpoint already means 'where my boil is' - "
-                    "which is how a lower-temperature or high-altitude boil is "
-                    "expressed. Settable mid-brew from the dashboard with Hold "
-                    "a temperature, which keeps it here until it is cleared. "
-                    "A Boil step in the mash profile clears it: a Boil step "
-                    "means boil. So does a restart of CraftBeerPi."),
+        description="Element duty while heating up to the boil, or to a hold "
+                    "from well below it."),
     Property.Number(
         label="Hold_Power", configurable=True, default_value=30,
-        description="Element duty while holding a setpoint BELOW boiling - a "
+        description="Element duty while holding a target BELOW the boil - a "
                     "whirlpool or hop stand - once the wort reaches it. Set "
-                    "the kettle target below the boil threshold and this "
-                    "logic holds it instead of boiling. Modest on purpose: a "
-                    "hold replaces standing losses, and full power near the "
-                    "target overshoots. More than 4 C / 7.2 F below the hold "
-                    "it heats at Max_Output, easing to this as it nears the "
-                    "hold. Raise it for a poorly insulated vessel."),
+                    "the kettle's target below the boil and this logic holds "
+                    "it instead of boiling. Modest on purpose: a hold replaces "
+                    "standing losses, and full power near the target "
+                    "overshoots. More than 4 C / 7.2 F below the hold it heats "
+                    "at Max_Output, easing to this as it nears the hold. Raise "
+                    "it for a poorly insulated vessel."),
     Property.Select(
         label="SampleTime", options=[2, 5],
         description="Seconds between control decisions. Matches PIDBoil."),
+    Property.Select(
+        label="Keep_Boiling", options=["Yes", "No"], default_value="Yes",
+        description="Yes: if the wort falls 2 C / 3.6 F below the boil, full "
+                    "power brings it back. No: once it has boiled, only "
+                    "Boil_Power heats, and the wort may fall if that is too "
+                    "low. Changeable while boiling from the brew-day screen."),
+    Property.Number(
+        label="Usual_Boil_Power", configurable=True,
+        description="The boil power each recipe starts at, 0-100%. When a "
+                    "recipe starts from its first step, Boil_Power goes back "
+                    "to this. Blank: Boil_Power stays as you left it."),
 ])
 class BoilPower(CBPiKettleLogic):
     """Ramp at full power, then hold a chosen duty."""
@@ -154,6 +201,24 @@ class BoilPower(CBPiKettleLogic):
     # it always was, so the element's heat and the probe's lag carry the wort
     # no further past the hold than before - let alone back to a boil.
     HOLD_CLIMB_C = 4.0
+
+    # How long the heat may stay paused before the brewer is warned, in
+    # brewing seconds. Scott, 10 Nov: a forgotten pause gets a warning on every
+    # page after 2 minutes. A boil-over is dealt with in seconds; two minutes
+    # off is a boil going cold with nobody watching.
+    PAUSE_WARN_AFTER_S = 120
+
+    # Keep_Boiling values that mean No. Anything else - including a kettle set
+    # up before the setting existed - is Yes, which is how this logic always
+    # behaved.
+    _NO = ("no", "false", "0", "off")
+
+    # A pause (set_paused): when it began on the brewing clock, else None; and
+    # its forgotten-pause warning once given - the notification's id, or True
+    # where CraftBeerPi gives none. Class defaults, so a logic built without
+    # __init__, as the tests and the transient action instance are, has them.
+    _paused_since = None
+    _pause_warned = None
 
     def _unit(self):
         return str(self.get_config_value("TEMP_UNIT", "C")).upper()
@@ -232,108 +297,40 @@ class BoilPower(CBPiKettleLogic):
             self.DEFAULT_BOIL_POWER,
         )
 
-    @action(
-        "Hold a temperature (whirlpool / hop stand)",
-        [Property.Number(
-            label="Hold_Target", configurable=True,
-            description="Temperature to hold instead of boiling. Must be below "
-                        "the boil point. Clear it to return to boiling.")],
-        # Settable while stopped for the same reason Boil_Power is: the moment
-        # a brewer reaches for this is as the boil ends, and answering "start
-        # the kettle first" at that moment is backwards.
-        allow_stopped=True,
-    )
-    async def set_hold_target(self, Hold_Target=None, Quiet=None, **kwargs):
-        """Start or clear a hold, without editing the recipe.
+    def _keep_boiling(self):
+        """Keep_Boiling, read fresh each pass: True unless it says No.
 
-        A blank value clears the hold and returns to ordinary boiling, which is
-        what makes this usable as a round trip: boil, hold for the stand, clear
-        it.
-
-        Quiet, for a caller that is not the brewer's dialog - a whirlpool step -
-        sets or clears without the message, so the caller can say why in its
-        own words. Not in the dialog. Scott, 4 Nov: at the end of a stand this
-        said "Hold cleared: Boil Kettle boils when it is switched on", as the
-        chill began. Refusals still warn and raise.
-
-        Kept with the kettle, in its Hold_Target setting, until it is cleared -
-        as Set boil power keeps Boil_Power. It used to be kept only on the
-        logic it was given to, and switching a kettle on builds a new logic: a
-        hold asked for while the kettle was off was accepted, and then the
-        kettle boiled at full power - 100% at 180 F in the 2 Nov review of the
-        recipe flow (GPT's G3). Stop and Start lost a running hold the same
-        way. Kept with the kettle, the logic switched on next reads it, and the
-        hold dialog, which opens on the kettle's setting, shows the hold in
-        force.
-
-        A Boil step in the mash profile clears it (_clear_hold_for_boil), so a
-        hold left from one brew's hop stand never turns a later boil into a
-        hold; and a hold cannot be set while a Boil step is boiling this kettle.
-        A restart of CraftBeerPi clears it too, and says so
-        (_clear_holds_after_restart).
-
-        Raises on a value it cannot use. Returning a failure here would be
-        invisible: BasicController.call_action returns True unconditionally
-        after awaiting an action and False only if it RAISES, so a refusal
-        expressed as a return value reaches no caller and the dialog closes
-        looking successful.
+        Yes is today's boil: the latch lets go when the wort falls
+        BOIL_EXIT_DROP_C below the boil, and full power brings it back. No
+        keeps the latch once the wort has boiled, so Boil_Power alone drives
+        it. Scott, 10 Nov, who had set 2% and watched the kettle cycle between
+        full power and 2%: "let the boil power fully drive the temp (ok to fall
+        if I set it too low %)".
         """
-        name = self._kettle_name()
-        running = bool(getattr(self, "running", False))
-        quiet = Quiet is True or str(Quiet).strip().lower() in ("yes", "true", "1")
-        if Hold_Target is None or str(Hold_Target).strip() == "":
-            self._hold_target_override = None
-            await self._keep_hold(None)
-            if not quiet:
-                self._tell(
-                    name,
-                    "Hold cleared - boiling normally." if running
-                    else "Hold cleared: {} boils when it is switched on.".format(name),
-                )
-            return
+        raw = self.props.get("Keep_Boiling", "Yes")
+        return str(raw).strip().lower() not in self._NO
 
-        boil_step = self._boil_step_on_this_kettle()
-        if boil_step is not None:
-            message = (
-                "'{}' is boiling {}, so no hold was set. Hold a temperature "
-                "once the boil has finished.".format(boil_step, name)
-            )
-            self._tell(name, message, NotificationType.WARNING)
-            raise ValueError(message)
+    async def _keep_setting(self, name, value):
+        """Keep a setting with the kettle, on disk, and tell every page.
 
+        Written to this logic's settings and to the kettle's, which are the
+        same dictionary for a running logic and may not be for the throwaway
+        one an action builds while the kettle is off. save() writes the file
+        and pushes an update without stopping the logic, unlike update().
+        Never raises: the setting is in force here either way.
+        """
         try:
-            target = float(Hold_Target)
-        except (TypeError, ValueError):
-            raise ValueError(
-                "Hold target needs a number, not {!r}. The hold was left "
-                "unchanged.".format(Hold_Target)
-            )
-        if target != target or target in (float("inf"), float("-inf")):
-            raise ValueError(
-                "Hold target needs a finite number, not {!r}.".format(Hold_Target)
-            )
-
-        boiling = self._configured_boiling()
-        drop = self.BOIL_EXIT_DROP_C * (1.0 if self._unit() == "C" else 1.8)
-        if target >= boiling - drop:
-            raise ValueError(
-                "A hold target of {:.1f} is not below the boil point {:.1f}, "
-                "so it would not be a hold. Lower it, or clear it to boil."
-                .format(target, boiling)
-            )
-
-        self._hold_target_override = target
-        await self._keep_hold(target)
-        if quiet:
-            return
-        if running:
-            self._tell(name, "Holding {:.1f} instead of boiling.".format(target))
-        else:
-            self._tell(
-                name,
-                "Hold {:.1f} set: switched on, {} holds it instead of "
-                "boiling.".format(target, name),
-            )
+            self.props[name] = value
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            kettle = self.get_kettle(self.id)
+            props = getattr(kettle, "props", None)
+            if props is not None and props is not self.props:
+                props[name] = value
+            await self.cbpi.kettle.save()
+        except Exception as e:  # noqa: BLE001 - never fail an action on this
+            logging.warning("BoilPower: could not keep %s with the kettle: %s", name, e)
 
     def _kettle_name(self):
         """This kettle's name, for the brewer. Never raises.
@@ -348,82 +345,6 @@ class BoilPower(CBPiKettleLogic):
             except Exception:  # noqa: BLE001
                 kettle = None
         return getattr(kettle, "name", None) or "Boil kettle"
-
-    def _hold_raw(self):
-        """The hold asked for, as given, or None: the override, else the
-        kettle's Hold_Target setting. Blank is none."""
-        override = getattr(self, "_hold_target_override", None)
-        if override is not None:
-            raw = override
-        else:
-            try:
-                raw = self.props.get("Hold_Target", None)
-            except Exception:  # noqa: BLE001
-                raw = None
-        if raw is None or str(raw).strip() == "":
-            return None
-        return raw
-
-    async def _keep_hold(self, target):
-        """Keep the hold with the kettle, on disk: its Hold_Target setting,
-        blank for none. Never raises - the hold is applied either way."""
-        value = "" if target is None else target
-        try:
-            self.props["Hold_Target"] = value
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            kettle = self.get_kettle(self.id)
-            props = getattr(kettle, "props", None)
-            if props is not None and props is not self.props:
-                props["Hold_Target"] = value
-            await self.cbpi.kettle.save()
-        except Exception as e:  # noqa: BLE001 - never fail an action on this
-            logging.warning("BoilPower: could not keep the hold with the kettle: %s", e)
-
-    def _boil_step_on_this_kettle(self):
-        """The name of the mash profile's running Boil step, if it boils this
-        kettle - else None. Never raises.
-
-        A Boil step means boil. Asked of the profile itself rather than told by
-        the step, so it holds on any CraftBeerPi, and for a logic that was
-        already running when the step started.
-        """
-        try:
-            find = getattr(getattr(self.cbpi, "step", None), "find_by_status", None)
-            if find is None:
-                return None
-            from cbpi.api.step import StepState
-            active = find(StepState.ACTIVE)
-            if active is None or getattr(active, "type", None) != "BoilStep":
-                return None
-            props = getattr(active, "props", None)
-            if props is None or props.get("Kettle", None) != self.id:
-                return None
-            return getattr(active, "name", None) or "The Boil step"
-        except Exception:  # noqa: BLE001
-            return None
-
-    async def _clear_hold_for_boil(self, boil_step):
-        """Drop the hold: the mash profile's Boil step is boiling this kettle.
-
-        Without this a hold is in force until the brewer clears it, and one
-        left from a hop stand would turn the next brew's boil into a hold at
-        hop-stand temperature. Cleared from the kettle as well, and said, so
-        the brewer knows why it has gone.
-        """
-        held = self._hold_raw()
-        self._hold_target_override = None
-        await self._keep_hold(None)
-        try:
-            shown = "{:.1f}".format(float(held))
-        except (TypeError, ValueError):
-            shown = str(held)
-        self._tell(
-            self._kettle_name(),
-            "Hold {} cleared: '{}' is boiling it. Set a hold again, with Hold "
-            "a temperature, once the boil has finished.".format(shown, boil_step),
-        )
 
     def _hold_power(self):
         """The duty a hold settles to at its target, read fresh each pass.
@@ -470,127 +391,73 @@ class BoilPower(CBPiKettleLogic):
         return int(hold + (max_output - hold) * share)
 
     def _configured_boiling(self):
-        """What counts as boiling on this rig, ignoring the live setpoint.
+        """Where this kettle boils: Boil_Threshold, else 99 C / 210.2 F.
 
-        Separate from _threshold() because the two answer different questions.
-        _threshold() asks "what temperature is this run aiming at", and the
-        kettle's setpoint wins there. This asks "where is the boil", which a
-        setpoint must not move - otherwise asking for a 170F hop stand would
-        redefine 170F as boiling, and there would be no way left to tell a hold
-        apart from a boil.
+        The one place the boil point is set. The kettle's target does not move
+        it: a target says which job the kettle has (_hold_target), and asking
+        for a 170 F hop stand must not redefine 170 F as boiling.
 
         Never raises: Boil_Threshold is free text and can be anything typed.
         """
-        configured = self._default_threshold()
-        raw = self.props.get("Boil_Threshold", None)
-        if raw is not None and raw != "":
-            try:
-                parsed = float(raw)
-                if parsed == parsed and parsed not in (float("inf"), float("-inf")):
-                    configured = parsed
-                else:
-                    logging.warning(
-                        "BoilPower: ignoring Boil_Threshold %r, using %.1f",
-                        raw, configured,
-                    )
-            except (TypeError, ValueError):
-                logging.warning(
-                    "BoilPower: ignoring Boil_Threshold %r, using %.1f",
-                    raw, configured,
-                )
-        return configured
+        return _boiling_in(self.props, self._unit())
+
+    def _target(self):
+        """The kettle's target, a finite number above 0, else None. Read
+        fresh. Never raises.
+
+        None is "no target", and BoilPower boils without one. Infinity and NaN
+        are no target either: an infinite setpoint once became a boil point
+        the wort could never reach, and the element held Max_Output for good
+        (cbpi-testbench test_safety_invariants, I5).
+        """
+        try:
+            value = float(self.get_kettle_target_temp(self.id) or 0)
+        except Exception:  # noqa: BLE001
+            # Broad on purpose: this calls into the core, and through it into
+            # whatever is registered. Anything raised here used to escape the
+            # control loop, which then died silently with the interface still
+            # showing the logic running.
+            logging.warning("BoilPower: could not read the kettle's target")
+            return None
+        if not math.isfinite(value) or value <= 0:
+            return None
+        return value
 
     def _hold_target(self, threshold, exit_drop):
-        """The temperature to hold, or None for an ordinary boil.
+        """The temperature to hold, or None for a boil.
 
-        Read from an explicit Hold_Target, NOT inferred from the setpoint.
+        The kettle's target, when it is more than exit_drop below the boil
+        point `threshold`. Scott, 10 Nov: "Set the boil kettle's target to
+        170 F, like the HLT, and it holds there". The HLT's PIDBoil works the
+        same way: it holds any target, and switches to its boil power only once
+        the wort reaches its own Boil_Threshold.
 
-        Inferring it was tried and was wrong. The first version treated any
-        setpoint meaningfully below the configured boiling point as a hop
-        stand, and two existing tests failed - correctly. This logic already
-        documents that the kettle's setpoint IS the boil threshold, which is
-        what lets a brewer at altitude, or anyone wanting a gentler boil, say
-        "my boil is at 205". Reinterpreting that as a bang-bang hold would
-        silently break a legitimate and already-supported use.
+        A target within exit_drop of the boil, or above it, is a boil - a Boil
+        step's 210 F or 212 F, or a 99 C one under a 99.5 C threshold - and so
+        is no target at all. A hold that close to boiling could not be told
+        apart from a boil, and the hold's own band would put it at the boil.
 
-        So a hold has to be asked for, not guessed at. An override set through
-        the action wins over the stored property, matching Boil_Power, so a
-        hold can be started and cleared mid-brew without editing the recipe.
-
-        `threshold` and `exit_drop` are still taken because the hold must be
-        below the boil to mean anything; a hold target at or above the boil
-        point is refused rather than silently fighting the boil branch.
+        This reverses a decision. Until 0.0.3.post7 the target WAS the boil
+        point, so "my boil is at 205" - at altitude, or for a gentler boil -
+        was said with the target, and a hold had to be asked for separately,
+        through Hold_Target. Boil_Threshold says where the boil is now, and a
+        gentler boil is Boil_Power.
         """
-        override = getattr(self, "_hold_target_override", None)
-        raw = override if override is not None else self.props.get(
-            "Hold_Target", None
-        )
-        if raw is None or raw == "":
-            return None
-        try:
-            target = float(raw)
-        except (TypeError, ValueError):
-            logging.warning("BoilPower: ignoring Hold_Target %r", raw)
-            return None
-        if target != target or target in (float("inf"), float("-inf")):
-            logging.warning("BoilPower: ignoring Hold_Target %r", raw)
-            return None
-        if target <= 0:
-            return None
-        boiling = self._configured_boiling()
-        if target >= boiling - exit_drop:
-            logging.warning(
-                "BoilPower: Hold_Target %.1f is not below the boil point "
-                "%.1f - ignoring it and boiling normally", target, boiling,
-            )
+        target = self._target()
+        if target is None or target >= threshold - exit_drop:
             return None
         return target
 
     def _threshold(self):
-        """Where full power ends and the fixed duty begins, read fresh.
+        """Where full power ends and the boil power begins: the boil point,
+        Boil_Threshold, read fresh each pass. Never raises.
 
-        Read on every pass, not once before the loop. Captured up front, a
-        change to the kettle's setpoint did nothing until the logic was
-        restarted - so the dashboard's temperature slider, which is labelled as
-        the boil threshold, silently had no effect on a running boil. A control
-        that appears to work and does not is worse than one that is absent.
-
-        The kettle's setpoint wins when there is one, leaving Boil_Threshold as
-        the default it falls back to.
-
-        Never raises. The configured value is a free-text property, so it can
-        be anything a brewer types, and a bare float() on it raised out of
-        run() before the heater had even been resolved - which meant both
-        cleanup paths skipped the de-energize and a failed start could leave an
-        already-on element running with no logic behind it.
+        It used to be the kettle's target when there was one, so the target
+        was the boil point. Now the target says boil or hold (_hold_target),
+        and only Boil_Threshold moves the boil point - set it with Boil at,
+        running or not.
         """
-        configured = self._configured_boiling()
-        try:
-            published = float(self.get_kettle_target_temp(self.id) or 0)
-            # Finite, not just "not NaN". An infinite setpoint passed the NaN
-            # test and became the boil point, which the wort can never reach:
-            # the boil was never recognised and the element held Max_Output
-            # for good instead of dropping to Boil_Power - 100% where no
-            # setpoint gives 85% (cbpi-testbench test_safety_invariants, I5).
-            # Neither can be a boil point, so both mean "no setpoint".
-            if published > 0 and math.isfinite(published):
-                return published
-        except Exception:  # noqa: BLE001
-            # Broad on purpose. This calls out into the core, and the core
-            # calls out into whatever is registered - a plugin, a database, a
-            # controller that has been torn down. Catching only the arithmetic
-            # errors meant anything else propagated out of _threshold, out of
-            # the control loop, and the loop died silently: measured as zero
-            # sensor reads and zero commands for the rest of the brew, while
-            # the interface still showed the logic running.
-            #
-            # The configured fallback below is a perfectly good answer, so
-            # there is nothing to gain by failing.
-            logging.warning(
-                "BoilPower: could not read the kettle setpoint, using %.1f",
-                configured,
-            )
-        return configured
+        return self._configured_boiling()
 
     # A vessel this far above boiling is dry, whatever the setpoint says.
     #
@@ -836,12 +703,249 @@ class BoilPower(CBPiKettleLogic):
             ),
         )
 
+    @action(
+        "Keep it at the boil",
+        [Property.Select(
+            label="Keep_Boiling", options=["Yes", "No"],
+            description="Yes: if the wort falls 2 C / 3.6 F below the boil, "
+                        "full power brings it back. No: once it has boiled, "
+                        "only the boil power heats, and the wort may fall.")],
+        # A setting, like Boil_Power: chosen before the boil as naturally as
+        # during it.
+        allow_stopped=True,
+    )
+    async def set_keep_boiling(self, Keep_Boiling=None, **kwargs):
+        """Keep the wort at the boil, or let the boil power alone drive it.
+
+        Kept with the kettle, so it holds from one brew day to the next until
+        it is changed. Used at the next control decision: set back to Yes
+        while the wort is well below the boil, full power comes back at once.
+
+        Raises on anything but Yes or No, after saying so: a refusal returned
+        instead reaches no caller, since BasicController.call_action reports a
+        failure only when the action raises.
+        """
+        name = self._kettle_name()
+        text = "" if Keep_Boiling is None else str(Keep_Boiling).strip().lower()
+        if text in ("yes", "true", "1", "on"):
+            keep = True
+        elif text in self._NO:
+            keep = False
+        else:
+            message = ("Keep it at the boil needs Yes or No, not {!r}. It was "
+                       "left as it was.".format(Keep_Boiling))
+            self._tell(name, message, NotificationType.WARNING)
+            raise ValueError(message)
+        before = self._keep_boiling()
+        stored = self.props.get("Keep_Boiling", None)
+        if keep == before and stored not in (None, ""):
+            # The value in force: what the old dashboard's Set sends.
+            return
+        await self._keep_setting("Keep_Boiling", "Yes" if keep else "No")
+        if keep == before:
+            return
+        if keep:
+            self._tell(name, "Keeping it at the boil: if the wort falls {:.1f}{} "
+                             "below {:.1f}{}, full power brings it back.".format(
+                                 self.BOIL_EXIT_DROP_C * self._degree_ratio(), self._deg(),
+                                 self._configured_boiling(), self._deg()))
+        else:
+            self._tell(name, "Boil power only: once it has boiled, only {}% heats, "
+                             "and the wort may fall if that is too low.".format(
+                                 self._boil_power()))
+
+    @action(
+        "Boil at",
+        [Property.Number(
+            label="Boil_Threshold", configurable=True,
+            description="Where this kettle boils: full power below it, the "
+                        "boil power from it. 190-212 F / 88-100 C. Blank: "
+                        "99 C / 210.2 F.")],
+        # A setting, like Boil_Power, and changed for the same reason mid-boil:
+        # a probe that never reaches the boil point on a low-pressure day
+        # holds full power until the brewer lowers it.
+        allow_stopped=True,
+    )
+    async def set_boil_at(self, Boil_Threshold=None, **kwargs):
+        """Move the boil point, running or not, without stopping the boil.
+
+        Kept with the kettle, in its Boil_Threshold setting. A kettle aiming
+        at the boil keeps aiming at it: its target moves with the boil point,
+        so raising the boil point never turns a boil into a hold. Blank goes
+        back to 99 C / 210.2 F.
+
+        Raises on a value it cannot use, after saying so (see set_paused).
+        """
+        name = self._kettle_name()
+        low, high = (88.0, 100.0) if self._unit() == "C" else (190.0, 212.0)
+        before = self._configured_boiling()
+        stored = self.props.get("Boil_Threshold", None)
+        if Boil_Threshold is None or str(Boil_Threshold).strip() == "":
+            if stored is None or str(stored).strip() == "":
+                return
+            new = ""
+        else:
+            try:
+                value = float(Boil_Threshold)
+            except (TypeError, ValueError):
+                value = float("nan")
+            if not math.isfinite(value) or not low <= value <= high:
+                message = ("Boil at needs a temperature from {:g} to {:g}{}, not "
+                           "{!r}. It still boils at {:.1f}{}.".format(
+                               low, high, self._deg(), Boil_Threshold, before, self._deg()))
+                self._tell(name, message, NotificationType.WARNING)
+                raise ValueError(message)
+            new = round(value, 1)
+            if stored is not None and str(stored).strip() != "" and new == before:
+                # The value in force: what the old dashboard's Set sends.
+                return
+        drop = self.BOIL_EXIT_DROP_C * self._degree_ratio()
+        target = self._target()
+        aiming_at_boil = target is not None and target >= before - drop
+        await self._keep_setting("Boil_Threshold", new)
+        after = self._configured_boiling()
+        if aiming_at_boil and target != after:
+            try:
+                await self.cbpi.kettle.set_target_temp(self.id, after)
+            except Exception as e:  # noqa: BLE001
+                logging.warning("BoilPower: could not move the target with the boil point: %s", e)
+        self._tell(name, "Boils at {:.1f}{} now (was {:.1f}{}).".format(
+            after, self._deg(), before, self._deg()))
+
+    @action(
+        "Pause the heat",
+        [Property.Select(
+            label="Paused", options=["No", "Yes"], default_value="No",
+            description="Yes: the element stays off while AUTO, the boil power "
+                        "and the recipe carry on - for a boil-over. No: heat "
+                        "again. MANUAL, ALL OFF or a restart end a pause.")],
+        # One action with the state it sets, not a pause and a resume, and
+        # allowed while stopped: the old dashboard's Set Target Temp dialog
+        # sends every action the logic declares, each with the value in force
+        # (seeded from the kettle's settings, or the default). So Set must
+        # change nothing here - Paused is No unless paused, Yes while paused -
+        # and a kettle that is off must not answer every Set with "start the
+        # logic first". A parameterless pause and resume would pause and resume
+        # the heat at every Set.
+        allow_stopped=True,
+    )
+    async def set_paused(self, Paused=None, **kwargs):
+        """Switch the element off and keep it off, without stopping AUTO; or
+        carry on heating.
+
+        For a boil-over. AUTO, the boil latch, Boil_Power and the recipe's
+        timer carry on (Scott, 10 Nov: the boil's timer keeps counting); only
+        the element stays off, until Paused is No. Carrying on goes back to
+        what AUTO does by then: the boil power once boiling, full power below,
+        or the hold. MANUAL or ALL OFF, which stop this logic, end a pause too.
+
+        Kept in the kettle's settings - Paused, Yes or No, and Paused_At, the
+        brewing-clock seconds it began - so every page shows the pause and
+        counts it from the same moment. After PAUSE_WARN_AFTER_S a warning is
+        kept on every page until OK.
+
+        Pausing is refused unless AUTO is running: a stopped kettle has no heat
+        to pause, and a pause it remembered would greet the next start.
+        Carrying on when not paused changes nothing, quietly.
+        """
+        name = self._kettle_name()
+        text = "" if Paused is None else str(Paused).strip().lower()
+        if text in ("yes", "true", "1", "on"):
+            pause = True
+        elif text in self._NO:
+            pause = False
+        else:
+            message = ("Pause the heat needs Yes or No, not {!r}. Nothing was "
+                       "changed.".format(Paused))
+            self._tell(name, message, NotificationType.WARNING)
+            raise ValueError(message)
+
+        if not pause:
+            if getattr(self, "_paused_since", None) is None:
+                return
+            await self._end_pause()
+            self._tell(name, "Heating again.")
+            return
+
+        if not getattr(self, "running", False):
+            message = "{}'s AUTO is off, so there is no heat to pause.".format(name)
+            self._tell(name, message, NotificationType.WARNING)
+            raise ValueError(message)
+        if getattr(self, "_paused_since", None) is not None:
+            return
+        self._paused_since = clock.now()
+        self._pause_warned = None
+        heater = getattr(self, "heater", None)
+        if heater is not None:
+            # At once, not at the next control decision: a boil-over is now.
+            await self.actor_off(heater)
+        await self._keep_setting("Paused_At", round(self._paused_since, 1))
+        await self._keep_setting("Paused", "Yes")
+        self._tell(name, "Heat paused. The element stays off until you carry on; "
+                         "AUTO, the boil power and the recipe carry on.")
+
+    async def _end_pause(self):
+        """Forget a pause, take its warning down from every page, and clear
+        Paused_At. Never raises; nothing to do if there was none."""
+        self._paused_since = None
+        warned, self._pause_warned = getattr(self, "_pause_warned", None), None
+        if warned is not None and warned is not True:
+            retire = getattr(getattr(self.cbpi, "notification", None), "retire", None)
+            if callable(retire):
+                try:
+                    retire(warned)
+                except Exception as e:  # noqa: BLE001
+                    logging.debug("BoilPower: could not take the pause warning down: %s", e)
+        try:
+            kept = self.props.get("Paused_At", None)
+            paused = self.props.get("Paused", None)
+        except Exception:  # noqa: BLE001
+            kept = paused = None
+        if kept not in (None, ""):
+            await self._keep_setting("Paused_At", "")
+        if paused not in (None, "", "No"):
+            await self._keep_setting("Paused", "No")
+
+    def _warn_if_pause_forgotten(self):
+        """Once a pause, after PAUSE_WARN_AFTER_S: a warning kept on every
+        page until OK, or until the pause ends. Never raises."""
+        since = getattr(self, "_paused_since", None)
+        if since is None or getattr(self, "_pause_warned", None) is not None:
+            return
+        try:
+            if clock.now() - since < self.PAUSE_WARN_AFTER_S:
+                return
+        except Exception:  # noqa: BLE001
+            return
+        name = self._kettle_name()
+        message = PAUSE_FORGOTTEN_TEXT.format(
+            kettle=name, minutes=int(self.PAUSE_WARN_AFTER_S // 60))
+        title = PAUSE_FORGOTTEN_TITLE.format(kettle=name)
+        logging.warning("%s: %s", title, message)
+        self._pause_warned = True
+        try:
+            warning = _notify_kept(self.cbpi, title, message, NotificationType.WARNING,
+                                   [NotificationAction("OK")])
+            if warning is not None:
+                self._pause_warned = warning
+        except Exception as e:  # noqa: BLE001
+            logging.warning("BoilPower: could not warn about the pause: %s", e)
+
+    def _degree_ratio(self):
+        return 1.0 if self._unit() == "C" else 1.8
+
+    def _deg(self):
+        return " \u00b0C" if self._unit() == "C" else " \u00b0F"
+
     async def on_stop(self):
         # Guarded: run() may have raised before self.heater was assigned, and an
         # AttributeError here would mask whatever actually went wrong.
         heater = getattr(self, "heater", None)
         if heater is not None:
             await self.actor_off(heater)
+        # MANUAL and ALL OFF end a pause: there is no AUTO left to carry on.
+        # After the element, which is what stopping is for.
+        await self._end_pause()
 
     async def run(self):
         try:
@@ -871,9 +975,9 @@ class BoilPower(CBPiKettleLogic):
             await self.actor_off(self.heater)
 
             sample_time = self._sample_time()
-            # The threshold itself is read per pass by _threshold(), so moving
-            # the setpoint acts on a running boil. Only the starting value is
-            # needed here, to publish a setpoint if the kettle has none.
+            # The boil point is read per pass by _threshold(), so moving it
+            # (Boil at) acts on a running boil. Only the starting value is
+            # needed here, to publish a target if the kettle has none.
             threshold = self._threshold()
             max_output = self._clamp_percent(
                 self.props.get("Max_Output", self.DEFAULT_MAX_OUTPUT),
@@ -882,6 +986,10 @@ class BoilPower(CBPiKettleLogic):
             # Preserve an override across a property edit, which constructs a
             # new instance; lose it on a genuine restart.
             self._boil_power_override = getattr(self, "_boil_power_override", None)
+            # A pause belongs to the AUTO run it was made in. One still in the
+            # settings is left from a run that ended without stopping - the
+            # server went down - and must not greet this one.
+            await self._end_pause()
 
             degree_ratio = 1.0 if self._unit() == "C" else 1.8
 
@@ -910,7 +1018,8 @@ class BoilPower(CBPiKettleLogic):
             except Exception:  # noqa: BLE001 - a cosmetic field, never fatal
                 pass
             announced_boil = False
-            announced_hold = False
+            # The hold last announced, so a changed one is said again.
+            announced_hold = None
             # What this loop last commanded, used only when the actor cannot be
             # read. Starts as 0 because the line above just de-energized it.
             commanded = 0
@@ -921,7 +1030,7 @@ class BoilPower(CBPiKettleLogic):
 
             while self.running:
                 current_temp = self._read_temp(sensor_id)
-                # Fresh every pass, so moving the setpoint acts on a running
+                # Fresh every pass, so moving the boil point acts on a running
                 # boil instead of waiting for a restart.
                 threshold = self._threshold()
 
@@ -940,8 +1049,9 @@ class BoilPower(CBPiKettleLogic):
                     await clock.sleep(sample_time)
                     continue
 
-                # A target set BELOW the boil threshold is a request to hold
-                # that temperature, not to boil - a whirlpool or hop stand.
+                # A target BELOW the boil is a request to hold that
+                # temperature, not to boil - a whirlpool or hop stand
+                # (_hold_target).
                 #
                 # Without this the logic is not merely unhelpful, it actively
                 # fights the brewer. Below `threshold - exit_drop` the boil
@@ -957,28 +1067,29 @@ class BoilPower(CBPiKettleLogic):
                 # decides the wort has come off the boil is reused as the
                 # hysteresis, so there is one notion of "meaningfully below"
                 # in this file rather than two.
-                # A Boil step in the mash profile means boil. A hold still in
-                # force - from this brew's hop stand or an earlier one's - is
-                # dropped before it can turn the boil into a hold.
-                boil_step = self._boil_step_on_this_kettle()
-                if boil_step is not None and self._hold_raw() is not None:
-                    await self._clear_hold_for_boil(boil_step)
-
+                #
+                # Read every pass, so a target changed mid-boil - by the
+                # brewer, or a Whirlpool step's Heat and hold - takes over at
+                # the next control decision. A Boil step sets its own target
+                # as it starts heating, so no hold from an earlier stand can
+                # reach a boil.
                 hold_target = self._hold_target(threshold, exit_drop)
                 if hold_target is not None:
                     boil_latched = False
                     announced_boil = False
-                    if not announced_hold:
-                        announced_hold = True
+                    if announced_hold != hold_target:
+                        announced_hold = hold_target
                         self._tell(
                             getattr(self.kettle, "name", "Kettle"),
-                            "Holding {:.1f} instead of boiling. Below it, it heats "
-                            "at {}% while the wort is more than {:.1f} below, "
-                            "easing to {}% as it reaches the hold; then it rests "
-                            "until the wort is {:.1f} below. To boil, clear it "
-                            "with Hold a temperature.".format(
+                            "Holding {:.1f}, its target, instead of boiling. "
+                            "Below it, it heats at {}% while the wort is more "
+                            "than {:.1f} below, easing to {}% as it reaches "
+                            "the hold; then it rests until the wort is {:.1f} "
+                            "below. To boil, set its target to {:.1f} or "
+                            "above.".format(
                                 hold_target, max_output, climb_band,
                                 self._hold_power(), exit_drop,
+                                threshold - exit_drop,
                             ),
                         )
                     # Heat only when below the band; off at or above target.
@@ -1004,14 +1115,22 @@ class BoilPower(CBPiKettleLogic):
                     else:
                         heat_percent = 0
                 else:
-                    announced_hold = False
+                    announced_hold = None
 
                     if current_temp >= threshold:
                         boil_latched = True
-                    elif boil_latched and current_temp < threshold - exit_drop:
+                    elif (boil_latched and current_temp < threshold - exit_drop
+                          and self._keep_boiling()):
                         # Genuinely off the boil - a lid opened, a chiller
                         # started, or the element failed - so go back to
                         # getting it there.
+                        #
+                        # Only when keeping it at the boil. With Keep_Boiling
+                        # No the brewer has said the boil power alone drives
+                        # the wort once it has boiled, and may fall: the latch
+                        # stays until AUTO stops, or a hold takes over. Read
+                        # each pass, so ticking it again while the wort is
+                        # well below brings full power back at once.
                         boil_latched = False
                         announced_boil = False
 
@@ -1029,6 +1148,14 @@ class BoilPower(CBPiKettleLogic):
                     else:
                         heat_percent = max_output
                         announced_boil = False
+
+                # Paused (set_paused): the element stays off whatever the above
+                # decided. Everything else carried on - the latch, the
+                # announcements - so carrying on goes straight back to what
+                # AUTO would be doing by then.
+                if self._paused_since is not None:
+                    heat_percent = 0
+                    self._warn_if_pause_forgotten()
 
                 # Drive the actor from what it IS doing, not from what this loop
                 # last told it to do.
@@ -1093,6 +1220,31 @@ class BoilPower(CBPiKettleLogic):
             heater = getattr(self, "heater", None)
             if heater is not None:
                 await self.actor_off(heater)
+            # However the loop ended, a pause ends with it. After the element.
+            await self._end_pause()
+
+
+def _boiling_in(settings, unit):
+    """Where a BoilPower kettle boils: Boil_Threshold in `settings`, else
+    99 C / 210.2 F in `unit` ("C" or "F"). Never raises: it is free text."""
+    if str(unit).strip().upper().startswith("C"):
+        default = BoilPower.DEFAULT_THRESHOLD_C
+    else:
+        default = BoilPower.DEFAULT_THRESHOLD_C * 9.0 / 5.0 + 32.0
+    try:
+        raw = settings.get("Boil_Threshold", None)
+    except Exception:  # noqa: BLE001
+        return default
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        parsed = None
+    if parsed is None or not math.isfinite(parsed):
+        logging.warning("BoilPower: ignoring Boil_Threshold %r, using %.1f", raw, default)
+        return default
+    return parsed
 
 
 def _hold_in(settings):
@@ -1107,10 +1259,15 @@ def _hold_in(settings):
     return raw
 
 
-def _clear_kettle_hold(kettle):
+def _clear_kettle_hold(kettle, unit="C"):
     """Clear the hold kept with `kettle`.
 
-    (the hold that was in force or None, whether anything was cleared)."""
+    A hold is the kettle's target, below where it boils: put back to the boil
+    point. And a Hold_Target setting left from before 0.0.3.post7, when a hold
+    was kept apart from the target, is cleared too - in the kettle's settings
+    and in any BoilPower settings put aside while it runs another logic.
+
+    (the hold that was in force or None, whether anything was changed)."""
     in_force, cleared = None, False
     if getattr(kettle, "type", None) == "BoilPower":
         props = getattr(kettle, "props", None)
@@ -1118,12 +1275,22 @@ def _clear_kettle_hold(kettle):
             in_force = _hold_in(props)
             props["Hold_Target"] = ""
             cleared = True
+        if props is not None:
+            boiling = _boiling_in(props, unit)
+            drop = BoilPower.BOIL_EXIT_DROP_C * (1.0 if str(unit).upper().startswith("C") else 1.8)
+            try:
+                target = float(getattr(kettle, "target_temp", None) or 0)
+            except (TypeError, ValueError):
+                target = 0.0
+            if math.isfinite(target) and 0 < target < boiling - drop:
+                in_force = target
+                kettle.target_temp = boiling
+                cleared = True
         # Kettles start switched off, so there is normally no logic yet.
         logic = getattr(kettle, "instance", None)
         if logic is not None:
-            logic._hold_target_override = None
             logic_props = getattr(logic, "props", None)
-            if logic_props is not None and logic_props is not props:
+            if logic_props is not None and logic_props is not props and _hold_in(logic_props) is not None:
                 logic_props["Hold_Target"] = ""
     # Put aside while the kettle runs another logic: switching back to
     # BoilPower would bring it back.
@@ -1145,12 +1312,13 @@ def _tell_hold_cleared(cbpi, kettle_name, held):
     except (TypeError, ValueError):
         shown = str(held)
     try:
-        unit = " °F" if str(cbpi.config.get("TEMP_UNIT", "C")).upper() == "F" else " °C"
+        unit = " \u00b0F" if str(cbpi.config.get("TEMP_UNIT", "C")).upper() == "F" else " \u00b0C"
     except Exception:  # noqa: BLE001
         unit = ""
     message = (
-        "CraftBeerPi restarted, and that cleared the hold at {}{}. Switched on "
-        "now, {} heats to a boil. To hold again, use Hold a temperature."
+        "CraftBeerPi restarted, and that cleared the hold at {}{}: the target "
+        "is back to the boil, so switched on now, {} heats to a boil. To hold "
+        "again, set its target below the boil."
         .format(shown, unit, kettle_name)
     )
     logging.warning("%s: %s", kettle_name, message)
@@ -1170,20 +1338,25 @@ async def _clear_holds_after_restart(cbpi):
     """A restart of CraftBeerPi clears every BoilPower hold, and says so.
 
     Scott, 3 Nov: "Restarts should clear the hold." A hold is kept with the
-    kettle so that switching the kettle off and on keeps it (0.0.3.post2). A
-    restart is different: the server may have been down for minutes or a
-    night, and a hold left in the kettle's settings waits for the next time the
-    kettle is switched on - perhaps the next brew. So a restart clears it, and
-    the brewer is told which hold went, in time to set it again.
+    kettle - its target, below the boil - so that switching the kettle off and
+    on keeps it. A restart is different: the server may have been down for
+    minutes or a night, and a hold left in the kettle's target waits for the
+    next time the kettle is switched on - perhaps the next brew. So a restart
+    puts the target back to the boil, and the brewer is told which hold went,
+    in time to set it again.
 
     A start-up hook: run once everything is loaded, before any page can
     connect. Never raises - a hook that raised would stop CraftBeerPi starting.
     """
     try:
+        unit = str(cbpi.config.get("TEMP_UNIT", "C") or "C")
+    except Exception:  # noqa: BLE001
+        unit = "C"
+    try:
         told, changed = [], False
         for kettle in list(getattr(cbpi.kettle, "data", None) or []):
             try:
-                held, cleared = _clear_kettle_hold(kettle)
+                held, cleared = _clear_kettle_hold(kettle, unit)
             except Exception as e:  # noqa: BLE001
                 logging.warning("BoilPower: could not clear the hold on %s: %s",
                                 getattr(kettle, "name", "a kettle"), e)
@@ -1200,6 +1373,156 @@ async def _clear_holds_after_restart(cbpi):
         _tell_hold_cleared(cbpi, kettle_name, held)
 
 
+async def _clear_pauses_after_restart(cbpi):
+    """A restart ends every pause. Kettles start switched off, so a Paused_At
+    still in a kettle's settings is from a run the server went down in. Quiet:
+    the heat it paused went with the server. Never raises."""
+    try:
+        changed = False
+        for kettle in list(getattr(cbpi.kettle, "data", None) or []):
+            if getattr(kettle, "type", None) != "BoilPower":
+                continue
+            props = getattr(kettle, "props", None)
+            if props is None or (props.get("Paused_At", None) in (None, "")
+                                 and props.get("Paused", None) in (None, "", "No")):
+                continue
+            props["Paused_At"] = ""
+            props["Paused"] = "No"
+            changed = True
+            logging.info("BoilPower: the restart ended the pause on %s",
+                         getattr(kettle, "name", "a kettle"))
+        if changed:
+            await cbpi.kettle.save()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("BoilPower: could not clear pauses after the restart: %s", e)
+
+
+def _usual_power(settings):
+    """Usual_Boil_Power in `settings`, a whole percent 0-100, or None: blank,
+    or nothing a percentage can be read from. Never raises."""
+    try:
+        raw = settings.get("Usual_Boil_Power", None)
+    except Exception:  # noqa: BLE001
+        return None
+    if raw is None or str(raw).strip() == "":
+        return None
+    return BoilPower._clamp_percent(raw, None)
+
+
+async def _usual_power_for_the_recipe(cbpi):
+    """Each BoilPower kettle with a Usual_Boil_Power: Boil_Power back to it,
+    and said, as the recipe starts. Never raises.
+
+    Scott, 10 Nov: each recipe starts at the usual boil power - his choice, of
+    "each boil starts at your usual power", moved to the recipe's start so a
+    power set during the sparge or the "Ready to boil?" hold is kept for that
+    boil. Said only when it changes something.
+    """
+    told = []
+    try:
+        changed = False
+        for kettle in list(getattr(cbpi.kettle, "data", None) or []):
+            if getattr(kettle, "type", None) != "BoilPower":
+                continue
+            props = getattr(kettle, "props", None)
+            usual = _usual_power(props) if props is not None else None
+            if usual is None:
+                continue
+            logic = getattr(kettle, "instance", None)
+            was = getattr(logic, "_boil_power_override", None)
+            if was is None:
+                was = BoilPower._clamp_percent(
+                    props.get("Boil_Power", BoilPower.DEFAULT_BOIL_POWER),
+                    BoilPower.DEFAULT_BOIL_POWER)
+            if was == usual:
+                continue
+            props["Boil_Power"] = usual
+            if logic is not None:
+                # A running logic reads its override first (_boil_power).
+                logic._boil_power_override = usual
+                logic_props = getattr(logic, "props", None)
+                if logic_props is not None and logic_props is not props:
+                    logic_props["Boil_Power"] = usual
+            changed = True
+            told.append((getattr(kettle, "name", None) or "Boil kettle", usual, was))
+        if changed:
+            await cbpi.kettle.save()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("BoilPower: could not put the usual boil power back: %s", e)
+        return
+    for name, usual, was in told:
+        message = ("Boil power back to your usual {}% (was {}%): the recipe "
+                   "started.".format(usual, was))
+        logging.info("%s: %s", name, message)
+        try:
+            cbpi.notify(name, message, NotificationType.INFO)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class _RecipeStart:
+    """Told about the brew steps (StepController.add_listener); puts the usual
+    boil power back when a recipe starts.
+
+    A recipe starting is its first step starting while it was still waiting.
+    Not that step stopped and started again, nor resumed after a restart: they
+    carry on a brew, and a power the brewer has set since must stand. The
+    listener's snapshot shows the step running either way, so each step's
+    status is remembered from one event to the next, beginning with what was
+    there as CraftBeerPi started. A step never seen before is new, so waiting.
+    """
+
+    def __init__(self, cbpi, snapshot=None):
+        self.cbpi = cbpi
+        self.status = self._statuses(snapshot)
+
+    @staticmethod
+    def _statuses(snapshot):
+        found = {}
+        for step in (snapshot or {}).get("steps") or []:
+            if isinstance(step, dict) and step.get("id") is not None:
+                found[step["id"]] = step.get("status")
+        return found
+
+    def __call__(self, event, snapshot):
+        fresh = False
+        try:
+            steps = (snapshot or {}).get("steps") or []
+            if event == "step_started" and steps and isinstance(steps[0], dict):
+                first = steps[0].get("id")
+                fresh = (snapshot.get("step_id") == first
+                         and self.status.get(first, "I") == "I")
+            self.status = self._statuses(snapshot)
+        except Exception as e:  # noqa: BLE001 - a listener never stops a brew
+            logging.warning("BoilPower: could not follow the brew steps: %s", e)
+            return None
+        # A coroutine: the step controller runs it as a task of its own.
+        return _usual_power_for_the_recipe(self.cbpi) if fresh else None
+
+
+def _listen_for_recipe_start(cbpi):
+    """Follow the brew steps for the usual boil power. -> the listener, or
+    None on a CraftBeerPi without step listeners, where Usual_Boil_Power is
+    not used. Never raises."""
+    step = getattr(cbpi, "step", None)
+    add = getattr(step, "add_listener", None)
+    if not callable(add):
+        logging.info("BoilPower: this CraftBeerPi cannot say when a recipe "
+                     "starts, so Usual_Boil_Power is not used")
+        return None
+    try:
+        snapshot = step.snapshot() if callable(getattr(step, "snapshot", None)) else None
+    except Exception:  # noqa: BLE001
+        snapshot = None
+    try:
+        listener = _RecipeStart(cbpi, snapshot)
+        add(listener)
+        return listener
+    except Exception as e:  # noqa: BLE001
+        logging.warning("BoilPower: could not follow the brew steps: %s", e)
+        return None
+
+
 def setup(cbpi):
     cbpi.plugin.register("BoilPower", BoilPower)
     try:
@@ -1209,4 +1532,12 @@ def setup(cbpi):
         cbpi.app.on_startup.append(clear_holds)
     except Exception as e:  # noqa: BLE001
         logging.warning("BoilPower: a restart will not clear holds: %s", e)
+    try:
+        async def after_restart(app):
+            await _clear_pauses_after_restart(cbpi)
+            _listen_for_recipe_start(cbpi)
+
+        cbpi.app.on_startup.append(after_restart)
+    except Exception as e:  # noqa: BLE001
+        logging.warning("BoilPower: a restart will not clear pauses: %s", e)
 

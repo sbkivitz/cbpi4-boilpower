@@ -1,7 +1,8 @@
 # cbpi4-boilpower
 
 A boil kettle logic for CraftBeerPi 4. Full power until the wort boils, then a
-fixed element duty the brewer sets from the dashboard.
+fixed element duty the brewer sets from the dashboard. Give the kettle a target
+below the boil, such as 170 °F for a hop stand, and it holds that instead.
 
 > ## ⚠️ Read before you run this
 >
@@ -34,6 +35,18 @@ thing left to choose is how hard it boils.
 below Boil_Threshold   ->  Max_Output, get there
 at or above it         ->  Boil_Power, hold that duty
 ```
+
+The kettle's target says which job it has, as on any kettle:
+
+```
+no target, or one at the boil   ->  boil, as above
+a target below the boil         ->  hold it there
+```
+
+"At the boil" means within 2 °C / 3.6 °F of `Boil_Threshold`, or above it, so
+a Boil step's 210 °F or 212 °F means boil wherever the threshold sits.
+`Boil_Threshold` is the one place the boil point is set; at altitude, set it to
+where your wort boils.
 
 ## What it deliberately does not do
 
@@ -115,7 +128,8 @@ plugin loads on an unmodified CraftBeerPi.
 
 ## Adjusting the boil while it runs
 
-Use the **Set boil power** action, from the dashboard.
+Use the actions, from the dashboard: **Set boil power**, **Keep it at the
+boil**, **Pause the heat** and **Boil at**.
 
 Do **not** change the power by editing the kettle's properties mid-boil.
 Editing any kettle property calls `BasicController.update()`, which calls
@@ -128,8 +142,54 @@ The action dispatches straight to the running logic and never touches
 `update()`, so the duty changes on the next control decision without the boil
 being interrupted.
 
-An adjustment made through the action applies to that boil only; it is not
-written to disk. Change `Boil_Power` to move the default permanently.
+Each action keeps its setting with the kettle, so a page opened later shows
+the value in force, and stopping and starting the kettle keeps it.
+
+Each declares one parameter, named for the setting it keeps, and does nothing
+when given the value already in force. That matters because the dashboard's
+**Set Target Temp** dialog sends every action the logic declares, each filled
+in with its value in force, every time Set is pressed. A pause and a resume as
+two actions without settings would pause and resume the heat at every Set.
+
+### Keep it at the boil
+
+`Keep_Boiling`, Yes by default. **Yes** is the boil latch below: if the wort
+falls 2 °C / 3.6 °F below the boil, full power brings it back. **No**: full
+power until the wort first boils, then only `Boil_Power`, and the wort may fall
+if that is too low. With a low boil power and Yes, the kettle cycles between
+full power and the boil power; with No it simply runs the boil power. Set back
+to Yes while the wort is well below the boil, full power returns at once.
+
+### Pause the heat
+
+For a boil-over. `Paused` Yes switches the element off at once and keeps it
+off, while AUTO, the boil latch, `Boil_Power` and the recipe's timer carry on.
+`Paused` No heats again, going straight to what AUTO would be doing by then.
+The pause is kept with the kettle as `Paused` and `Paused_At` (brewing-clock
+seconds), so every page shows it and counts it from the same moment.
+
+After 2 brewing minutes paused, a warning, "Boil Kettle heat still paused", is
+kept on every page until OK. It is given once a pause, and taken down when the
+heat carries on or AUTO stops. MANUAL, ALL OFF and a restart end a pause.
+Pausing is refused while AUTO is off.
+
+### Usual boil power
+
+`Usual_Boil_Power`, blank by default. When a recipe starts from its first
+step, `Boil_Power` goes back to it, and a message says so: "Boil power back to
+your usual 45% (was 35%): the recipe started." A power set later that day, in
+the sparge or the hold before the boil, is kept for that boil. Stopping and
+starting the first step, or resuming it after a restart, carries the brew on
+and changes nothing. Needs a CraftBeerPi with step listeners (this fork, from
+cbpi4 4.7.7.post30); on one without, the setting is not used.
+
+### Boil at
+
+`Boil_Threshold`, 190–212 °F or 88–100 °C, changed without stopping the boil:
+for a probe that never quite reaches the boil point on a low-pressure day. A
+kettle aiming at the boil keeps aiming at it: its target moves with the boil
+point, so raising it never turns a boil into a hold. Blank goes back to
+99 °C / 210.2 °F.
 
 ## Timing
 
@@ -170,23 +230,26 @@ behave as they are configured to.
   a window can restart it and hold the element on past the duty it was given.
   The failure is logged once when it starts, not once per pass.
 
-## The dashboard setpoint
+## The kettle's target
 
-The kettle's existing temperature slider writes `target_temp`, and this logic
-reads it as the boil threshold. That keeps the slider meaningful rather than
-dead, and stops the setpoint widget reading zero.
+The kettle's existing temperature slider writes `target_temp`, as it does for
+any kettle. Set it at or above the boil point to boil; set it below to hold.
+When the logic starts with no target, it puts the boil point in as the target,
+so the setpoint widget never reads zero.
 
-Set it to your boiling point — around **210 °F / 99 °C**, adjusted for
-altitude. A low setpoint means the kettle latches "boiling" almost immediately
-and drops to the holding duty long before the wort is hot.
+Until 0.0.3.post7 this logic read the target as the boil threshold, so a low
+setpoint meant "my boil is here", and a hold was a separate setting. Now
+`Boil_Threshold` says where the boil is, and the target says boil or hold, as
+the HLT's PIDBoil has always treated a target below its own threshold. Scott,
+10 Nov: "Set the boil kettle's target to 170 °F, like the HLT, and it holds
+there".
 
 ## Holding below the boil: whirlpool or hop stand
 
-The **Hold a temperature** action holds the wort at a temperature below the
-boil, for example 170 °F, instead of boiling it. Below the target it heats, and
-at the target it switches off. Once there, it rests until the wort falls more
-than 2 °C / 3.6 °F below, then heats again. Leave the field blank to clear it
-and boil again.
+Set the kettle's target below the boil, for example 170 °F, and it holds the
+wort there instead of boiling it. Below the target it heats, and at the target
+it switches off. Once there, it rests until the wort falls more than
+2 °C / 3.6 °F below, then heats again. Set the target back to the boil to boil.
 
 How hard it heats depends on how far below the target the wort is. More than
 4 °C / 7.2 °F below, for example a whirlpool that cooled too far, it heats at
@@ -200,51 +263,52 @@ within 7.2 °F of the hold, and at the target it is at `Hold_Power`, so it
 carries the wort no further past the hold than a flat `Hold_Power` did. Raise
 `Hold_Power` if your kettle loses a lot of heat.
 
-- The hold is saved in the kettle's `Hold_Target` setting and stays in force
-  until you clear it. So you can set it while the kettle is off, then switch
-  the kettle on, and the kettle holds rather than boils. Stop and Start keep
-  it too. The dialog opens showing the hold in force.
-- A **Boil step** in the mash profile clears it. A hold left from one brew's
-  hop stand would otherwise turn the next brew's boil into a hold. A hold
-  can't be set while a Boil step is boiling the kettle: set it once the boil
-  has finished.
-- A **restart** of CraftBeerPi clears it, power cut or not. A message then
-  says which hold was cleared, and stays until you press OK, so a page you
-  open after the restart shows it too. Switched on after a restart, the kettle
-  heats to a boil until you set the hold again.
+- The hold is the kettle's target, so it is kept like any target: set it
+  while the kettle is off, switch the kettle on, and the kettle holds rather
+  than boils. Stop and Start keep it too.
+- A **Boil step** sets its own target as it starts heating, so a hold left
+  from one brew's hop stand never reaches the next brew's boil. A hold set
+  while a Boil step runs is honoured: you asked for it.
+- A **restart** of CraftBeerPi clears it, power cut or not, by putting the
+  target back to the boil point. A message then says which hold was cleared,
+  and stays until you press OK, so a page you open after the restart shows it
+  too.
 
-Until 0.0.3.post2 the hold was kept only by the running logic, so a hold set
-while the kettle was off was lost when it was switched on, and the kettle
-boiled at full power. In 0.0.3.post2 a restart kept the hold; from 0.0.3.post3
-it clears it. Until 0.0.3.post4 a hold never climbed: far below its target it
-heated at `Hold_Power` too. Until 0.0.3.post6 it dropped to a flat
-`Hold_Power` 7.2 °F short of the target, which only just beats a kettle's
-losses, so the last few degrees crawled: on the simulated kettle above it
-never got past 168 °F in a 20 minute stand. Scott, 4 Nov: "I don't think if
-I'm attempting to heat back up from where I over-cooled, I should be forced to
-use the hold_power value".
+CraftBeerPi's **WhirlpoolStep** uses this hold. If the wort cools too far
+during the stand, it asks whether to heat back and hold; it then sets the
+kettle's target to the whirlpool temperature and switches the kettle on. When
+the stand ends it switches the kettle off and puts back the target it found
+(cbpi4 4.7.7.post36), so the kettle switched on later boils.
 
-CraftBeerPi's **WhirlpoolStep** (cbpi4 4.7.7.post27) uses this hold. If the
-wort cools too far during the stand, it asks whether to heat back and hold,
-and when the stand ends it switches the kettle off and clears the hold.
-
-A step like that sets and clears the hold with `Quiet` (from 0.0.3.post5), so
-this plugin says nothing and the step says what happened in its own words:
-"Stand over: Boil Kettle is off and no longer holding 170 °F". Before, the end
-of a stand showed "Hold cleared: Boil Kettle boils when it is switched on",
-which read as if the kettle were about to boil as the chill began. The
-dashboard dialog doesn't offer `Quiet`, and a refused hold still warns.
+History. Until 0.0.3.post2 a hold was kept only by the running logic, so a hold
+set while the kettle was off was lost when it was switched on, and the kettle
+boiled at full power. From 0.0.3.post3 a restart clears a hold. Until
+0.0.3.post4 a hold never climbed: far below its target it heated at
+`Hold_Power` too. Until 0.0.3.post6 it dropped to a flat `Hold_Power` 7.2 °F
+short of the target, which only just beats a kettle's losses, so the last few
+degrees crawled. Scott, 4 Nov: "I don't think if I'm attempting to heat back up
+from where I over-cooled, I should be forced to use the hold_power value".
+Until 0.0.3.post7 a hold was the `Hold_Target` setting, set with a **Hold a
+temperature** action; a restart clears one left in a kettle's settings. That
+action had to go: the Set Target Temp dialog sends every action with its value
+in force, so a hold kept apart from the target would undo the target its own
+slider had just set.
 
 ## Properties
 
 | Property | Default | Meaning |
 |---|---|---|
-| `Boil_Threshold` | 99 °C / 210.2 °F | Where full power ends and fixed duty begins |
+| `Boil_Threshold` | 99 °C / 210.2 °F | Where the kettle boils: full power below, fixed duty from it. A target within 2 °C / 3.6 °F of it, or above, means boil |
 | `Boil_Power` | 85 | Element duty once boiling, 0–100 % |
 | `Max_Output` | 100 | Element duty while heating up |
-| `Hold_Target` | blank | Temperature to hold instead of boiling; blank boils |
 | `Hold_Power` | 30 | Element duty a hold settles to at its target, 0–100 %; below, it eases up towards `Max_Output` |
 | `SampleTime` | 5 | Seconds between control decisions |
+| `Keep_Boiling` | Yes | Yes: full power brings the wort back to the boil. No: once boiled, only `Boil_Power` |
+| `Usual_Boil_Power` | blank | The boil power each recipe starts at; blank leaves `Boil_Power` alone |
+
+The logic also keeps `Paused` and `Paused_At` in a kettle's settings while the
+heat is paused. They are not settings to edit: a start, a stop and a restart
+clear them.
 
 Temperature defaults are authored in Celsius and converted, so a bare number is
 never interpreted as Fahrenheit on a Fahrenheit rig.
@@ -265,8 +329,11 @@ fails to load — always `pip install`.
 
 ## Tests
 
-`test_boilpower.py` in the testbench covers 44 checks, loading this file **by
+`test_boilpower.py` in the testbench covers 86 checks, loading this file **by
 path** so a run can never pass against a stale installed copy.
+`test_boilpower_brewday_controls.py` covers keep it at the boil, the pause and
+its warning, the usual boil power and boil at (64 checks), and
+`test_boilpower_hold_kept.py` and `test_boilpower_whirlpool.py` the hold.
 
 Two notes on what that suite is worth. It models the actor as real state that
 the commands mutate, because an earlier harness stubbed the commands as pure
