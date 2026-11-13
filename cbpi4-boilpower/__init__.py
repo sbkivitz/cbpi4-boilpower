@@ -1,5 +1,5 @@
 """Full power to the boil, then a fixed duty the brewer sets from the dashboard;
-or, given a target below the boil, hold it there.
+or, given a target below the boil, hold it there with a PID.
 
 A boil does not need a PID. Once wort is boiling its temperature stops being a
 control variable - it sits at the boiling point whatever you do - and the only
@@ -13,8 +13,8 @@ The kettle's target says which job it has, as on any kettle (Scott, 10 Nov:
 "Set the boil kettle's target to 170 F, like the HLT, and it holds there"):
 
     no target, or one at the boil   ->  boil, as above
-    a target below the boil         ->  hold it: a whirlpool, a hop stand,
-                                        warm water
+    a target below the boil         ->  hold it with a PID: a mash in a bag,
+                                        a whirlpool, a hop stand, warm water
 
 "At the boil" is within BOIL_EXIT_DROP_C of Boil_Threshold or above, so a Boil
 step's 210 F or 212 F means boil wherever the threshold sits. Boil_Threshold is
@@ -121,18 +121,26 @@ def _notify_kept(cbpi, title, message, type, action):
                     "dashboard while the boil runs."),
     Property.Number(
         label="Max_Output", configurable=True, default_value=100,
-        description="Element duty while heating up to the boil, or to a hold "
-                    "from well below it."),
+        description="Element duty while heating up to the boil, and the most "
+                    "the PID may use while it holds a target below the boil."),
     Property.Number(
-        label="Hold_Power", configurable=True, default_value=30,
-        description="Element duty while holding a target BELOW the boil - a "
-                    "whirlpool or hop stand - once the wort reaches it. Set "
-                    "the kettle's target below the boil and this logic holds "
-                    "it instead of boiling. Modest on purpose: a hold replaces "
-                    "standing losses, and full power near the target "
-                    "overshoots. More than 4 C / 7.2 F below the hold it heats "
-                    "at Max_Output, easing to this as it nears the hold. Raise "
-                    "it for a poorly insulated vessel."),
+        label="P", configurable=True,
+        description="Holding a target below the boil - a mash in a bag, a "
+                    "whirlpool, a hop stand - a PID sets the element's power. "
+                    "P: % of power per degree below the target. Blank: 25.2 "
+                    "per C / 14 per F. The PID AutoTune plugin's P, I and D "
+                    "fit here."),
+    Property.Number(
+        label="I", configurable=True,
+        description="The PID's I: % of power per degree per second the wort "
+                    "stays below the target, building up within 2.8 C / 5 F "
+                    "of it. Blank: 0.054 per C / 0.03 per F."),
+    Property.Number(
+        label="D", configurable=True,
+        description="The PID's D: % of power taken off per degree per second "
+                    "the wort is rising, so it slows before the target rather "
+                    "than overshooting. Blank: 1620 per C / 900 per F. 0 "
+                    "turns it off."),
     Property.Select(
         label="SampleTime", options=[2, 5],
         description="Seconds between control decisions. Matches PIDBoil."),
@@ -149,17 +157,14 @@ def _notify_kept(cbpi, title, message, type, action):
                     "to this. Blank: Boil_Power stays as you left it."),
 ])
 class BoilPower(CBPiKettleLogic):
-    """Ramp at full power, then hold a chosen duty."""
+    """Ramp at full power, then hold a chosen duty; or hold a target below the
+    boil with a PID."""
 
     # Defaults are authored in Celsius and converted, because a bare number in
     # a property default is a Celsius value on a Fahrenheit rig - which is how
     # a 20 C ambient became 20 F elsewhere in this project.
     DEFAULT_THRESHOLD_C = 99.0
     DEFAULT_BOIL_POWER = 85
-    # Duty while holding below boiling - a whirlpool or hop stand. Modest on
-    # purpose: a hold replaces standing losses. Raise it for a poorly insulated
-    # vessel. Far below the hold it climbs at Max_Output first (HOLD_CLIMB_C).
-    DEFAULT_HOLD_POWER = 30
     DEFAULT_MAX_OUTPUT = 100
     DEFAULT_SAMPLE_TIME = 5
 
@@ -184,23 +189,44 @@ class BoilPower(CBPiKettleLogic):
     # default here.
     BOIL_EXIT_DROP_C = 2.0
 
-    # How far below a hold the wort must be for the hold to climb back at
-    # Max_Output. Within this of the target it eases off in proportion, down
-    # to Hold_Power at the target (_hold_climb_power).
+    # The PID that holds a target below the boil (_HoldPID). Until 0.0.3.post8
+    # a hold heated at a power that eased off as the wort neared its target,
+    # switched off at the target and rested until the wort was 3.6 F below,
+    # so a hold sat up to 4 F under its target. Scott, 13 Nov, holding 150 F
+    # for a mash in a bag: "I think the boilPower should also be able to do
+    # PID control", then "add a switch or checkbox as a last resort, I think
+    # this behavior should be automatic". So a hold is simply PID control,
+    # with nothing to choose it.
     #
-    # Scott, 4 Nov, on a whirlpool that had cooled too far: "I'd like a prompt
-    # to ask if I want to raise temp back to whirlpool temp and hold". Hold_Power
-    # replaces standing losses; it does not climb. On the simulator's boil
-    # kettle - 5.5 kW, 40 litres, losing about 1.4 kW at 170 F - 30% would
-    # take about an hour to climb back from 158 F, longer than the stand; full
-    # power takes about five minutes. And then, of the flat 30% that took over
-    # 7.2 F short: "I should not be forced to use the hold_power value".
+    # Gains as PIDBoil's, which are PIDArduino's: % of the element per degree
+    # below the target, per degree-second, and per degree-per-second of rise,
+    # so the PID AutoTune plugin's results fit. Authored in Celsius and
+    # converted, like every default here: 14, 0.03 and 900 in Fahrenheit.
     #
-    # Never full power near the target: within this of it the power falls
-    # away as the wort closes in, and at the hold it is the gentle Hold_Power
-    # it always was, so the element's heat and the probe's lag carry the wort
-    # no further past the hold than before - let alone back to a boil.
-    HOLD_CLIMB_C = 4.0
+    # Chosen on cbpi4-simvessel's equations for both boil kettles this runs:
+    # the simulators' (40 L, 5.5 kW, losing 25 W/K, probe 20 s behind) and the
+    # rig's (RIG-NOTES 27.6: 205 kJ/K, 5.3 kW, about 5 W/K, probe about 65 s
+    # behind), the rig's again with a probe twice as slow, as a bag of grain
+    # might make it, and each at half the volume. From cold to 150 F the rig's
+    # passes it by about 0.8 F (1.4 F with the slower probe) and then holds
+    # within 0.1 F; the simulators' passes it by 0.3 F. A whirlpool chilled to
+    # 158 F is back within 2 F of 170 F in about 5 minutes on the rig and 7 on
+    # the simulators. What the rig really does is untested.
+    DEFAULT_P_C = 25.2
+    DEFAULT_I_C = 0.054
+    DEFAULT_D_C = 1620.0
+
+    # The integral builds up only this close to the target. Climbing from far
+    # below it would otherwise build up all the way, and the rig's kettle,
+    # which takes hours to lose a few degrees, would sit past its target:
+    # about 2 F past, on the simulated rig, against 0.8 F like this.
+    INTEGRAL_BAND_C = 2.8
+
+    # The D term brakes on how fast the readings rise: a straight line through
+    # the last this-many seconds of them. A rig probe reads in steps of
+    # 0.11 F, and the difference of two readings would kick the element at
+    # every step.
+    DERIVATIVE_WINDOW_S = 60.0
 
     # How long the heat may stay paused before the brewer is warned, in
     # brewing seconds. Scott, 10 Nov: a forgotten pause gets a warning on every
@@ -346,49 +372,29 @@ class BoilPower(CBPiKettleLogic):
                 kettle = None
         return getattr(kettle, "name", None) or "Boil kettle"
 
-    def _hold_power(self):
-        """The duty a hold settles to at its target, read fresh each pass.
+    def _pid_gains(self):
+        """The hold's P, I and D in the server's unit: each the kettle's
+        setting, else the default. Never raises.
 
-        Not Max_Output near the target. An earlier version of this branch used
-        full output whenever the reading fell below the hold band, and a test
-        caught it: on a full kettle with a multi-kilowatt element, 100% to
-        close a six degree gap overshoots straight back towards a boil. That is
-        the failure this whole branch exists to prevent, reintroduced one layer
-        down. Full output is used only to climb from well below the hold
-        (HOLD_CLIMB_C); from there the duty eases down to this one at the
-        target (_hold_climb_power).
-
-        Deliberately not Boil_Power either. That duty is chosen to sustain a
-        rolling boil, which is far more than replacing standing losses at a hop
-        stand.
-
-        A separate knob rather than a derived fraction, because how hard to
-        hold depends on the vessel, its insulation and the element - none of
-        which this plugin can know.
+        A setting is taken as entered, in the unit the server runs in, as
+        PIDBoil takes its own; a default is Celsius and converted. A blank,
+        unreadable, infinite or negative setting is the default - a negative
+        gain would heat the wort harder the further it rose past its target.
+        0 is a setting: no D, say.
         """
-        return self._clamp_percent(
-            self.props.get("Hold_Power", self.DEFAULT_HOLD_POWER),
-            self.DEFAULT_HOLD_POWER,
-        )
-
-    def _hold_climb_power(self, below, climb_band, max_output):
-        """The duty for wort `below` the hold, within climb_band of it.
-
-        In proportion: Max_Output at climb_band below, easing to Hold_Power at
-        the hold. Scott, 4 Nov, of a whirlpool cooled too far: "if I'm
-        attempting to heat back up from where I over-cooled, I should not be
-        forced to use the hold_power value". A flat Hold_Power from 7.2 F
-        below only just beat the losses, and on the simulator's kettle the
-        last 5 F took most of a 20 minute stand.
-
-        Proportional, like the P of a PID, with no settings of its own to tune.
-        Truncated, so it never reaches Max_Output inside the band. At the hold
-        it is Hold_Power, as it always was, so it carries the wort no further
-        past it than before.
-        """
-        hold = self._hold_power()
-        share = min(1.0, max(0.0, below / climb_band)) if climb_band > 0 else 1.0
-        return int(hold + (max_output - hold) * share)
+        ratio = self._degree_ratio()
+        gains = []
+        for label, celsius in (("P", self.DEFAULT_P_C),
+                               ("I", self.DEFAULT_I_C),
+                               ("D", self.DEFAULT_D_C)):
+            try:
+                value = float(self.props.get(label))
+            except (TypeError, ValueError):
+                value = None
+            if value is None or not math.isfinite(value) or value < 0:
+                value = celsius / ratio
+            gains.append(value)
+        return tuple(gains)
 
     def _configured_boiling(self):
         """Where this kettle boils: Boil_Threshold, else 99 C / 210.2 F.
@@ -1026,7 +1032,13 @@ class BoilPower(CBPiKettleLogic):
             # Once boiling, stay boiling until the wort genuinely comes off it.
             boil_latched = False
             exit_drop = self.BOIL_EXIT_DROP_C * degree_ratio
-            climb_band = self.HOLD_CLIMB_C * degree_ratio
+            # The hold's PID: its gains are read once, as Max_Output is - a
+            # changed setting restarts the logic anyway - and the PID itself
+            # is made as a hold begins and dropped when it ends, so a
+            # whirlpool after the boil starts afresh rather than with what
+            # the mash built up.
+            gains = self._pid_gains()
+            hold_pid = None
 
             while self.running:
                 current_temp = self._read_temp(sensor_id)
@@ -1046,12 +1058,15 @@ class BoilPower(CBPiKettleLogic):
                     # that IS on is how an element stays live.
                     await self.actor_off(self.heater)
                     commanded = 0
+                    # The wort's rise can't be told across the gap.
+                    if hold_pid is not None:
+                        hold_pid.forget_readings()
                     await clock.sleep(sample_time)
                     continue
 
                 # A target BELOW the boil is a request to hold that
-                # temperature, not to boil - a whirlpool or hop stand
-                # (_hold_target).
+                # temperature, not to boil - a mash in a bag, a whirlpool or a
+                # hop stand (_hold_target).
                 #
                 # Without this the logic is not merely unhelpful, it actively
                 # fights the brewer. Below `threshold - exit_drop` the boil
@@ -1061,12 +1076,11 @@ class BoilPower(CBPiKettleLogic):
                 # "a chiller started" as a trigger, which is exactly this case
                 # described and then answered backwards.
                 #
-                # Bang-bang rather than PID: a hop stand wants "do not fall
-                # below the target", not tight regulation, and the vessel's
-                # thermal mass does most of the work. The same band that
-                # decides the wort has come off the boil is reused as the
-                # hysteresis, so there is one notion of "meaningfully below"
-                # in this file rather than two.
+                # Held with a PID (_HoldPID), as the HLT's PIDBoil holds its
+                # target. Until 0.0.3.post8 it was bang-bang - "a hop stand
+                # wants do not fall below, not tight regulation" - and a mash
+                # does want tight regulation: the hold sat up to 4 F under its
+                # target (Scott, 13 Nov).
                 #
                 # Read every pass, so a target changed mid-boil - by the
                 # brewer, or a Whirlpool step's Heat and hold - takes over at
@@ -1077,45 +1091,37 @@ class BoilPower(CBPiKettleLogic):
                 if hold_target is not None:
                     boil_latched = False
                     announced_boil = False
+                    if hold_pid is None:
+                        hold_pid = _HoldPID(
+                            *gains,
+                            band=self.INTEGRAL_BAND_C * degree_ratio,
+                            window=self.DERIVATIVE_WINDOW_S,
+                            sample=sample_time,
+                            max_output=max_output,
+                        )
                     if announced_hold != hold_target:
                         announced_hold = hold_target
                         self._tell(
                             getattr(self.kettle, "name", "Kettle"),
-                            "Holding {:.1f}, its target, instead of boiling. "
-                            "Below it, it heats at {}% while the wort is more "
-                            "than {:.1f} below, easing to {}% as it reaches "
-                            "the hold; then it rests until the wort is {:.1f} "
-                            "below. To boil, set its target to {:.1f} or "
-                            "above.".format(
-                                hold_target, max_output, climb_band,
-                                self._hold_power(), exit_drop,
-                                threshold - exit_drop,
+                            "Holding {:.1f}, its target, instead of boiling: "
+                            "a PID sets the element's power, up to {}%. To "
+                            "boil, set its target to {:.1f} or above.".format(
+                                hold_target, max_output, threshold - exit_drop,
                             ),
                         )
-                    # Heat only when below the band; off at or above target.
-                    # Overshoot on a vessel this size is slow, and a hop stand
-                    # a few degrees high is mild - sitting at full power is not.
-                    # Far below, climb at full power to within climb_band
-                    # first (HOLD_CLIMB_C); within it, ease off in proportion
-                    # to how far below the wort still is, down to Hold_Power
-                    # at the hold (_hold_climb_power). Hold_Power alone
-                    # barely beats the losses of a kettle that has cooled well
-                    # past the hold, and the last few degrees crawled.
-                    below = hold_target - current_temp
-                    if below >= climb_band:
-                        heat_percent = max_output
-                    elif below <= 0:
-                        heat_percent = 0
-                    elif below > exit_drop or (commanded or 0) > 0:
-                        # Below the band, or inside it and still heating:
-                        # carry on, rather than chattering the element every
-                        # pass - eased, never at a climb's full power, even if
-                        # the wort crossed both bands between two readings.
-                        heat_percent = self._hold_climb_power(below, climb_band, max_output)
-                    else:
-                        heat_percent = 0
+                    # Far below the target the PID asks for more than
+                    # Max_Output and climbs at it; nearer, it eases off,
+                    # braking on the wort's rise so the element's heat and the
+                    # probe's lag don't carry the wort past - let alone back
+                    # to a boil. Above the target it is off. A pause stops the
+                    # integral building up while the element can't heat.
+                    heat_percent = int(round(hold_pid.output(
+                        current_temp, hold_target,
+                        integrate=self._paused_since is None,
+                    )))
                 else:
                     announced_hold = None
+                    hold_pid = None
 
                     if current_temp >= threshold:
                         boil_latched = True
@@ -1222,6 +1228,70 @@ class BoilPower(CBPiKettleLogic):
                 await self.actor_off(heater)
             # However the loop ended, a pause ends with it. After the element.
             await self._end_pause()
+
+
+class _HoldPID:
+    """The PID that holds a target below the boil (BoilPower.DEFAULT_P_C).
+
+    PIDArduino's arithmetic, as PIDBoil's: the integral stops building up
+    when it would push further into a rail the output is already against,
+    and the D term acts on the readings rather than the error, so a new
+    target doesn't kick the element. Two changes, for a kettle whose probe is
+    a minute behind the wort: the integral builds up only within `band` of
+    the target (BoilPower.INTEGRAL_BAND_C), and the rate the D term brakes on
+    is a straight line through the last `window` seconds of readings
+    (BoilPower.DERIVATIVE_WINDOW_S).
+
+    Time is counted in control passes of `sample` brewing seconds, as
+    PIDArduino counts it, so it needs no clock and gives the same result at
+    any simulator speed.
+    """
+
+    def __init__(self, kp, ki, kd, band, window, sample, max_output):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.band = band
+        self.window = window
+        self.sample = sample
+        self.max_output = max_output
+        self.integral = 0.0
+        self.last_output = 0.0
+        self._t = 0.0
+        self._readings = []
+
+    def forget_readings(self):
+        """A pass with no reading: the rise can't be told across the gap."""
+        self._readings = []
+
+    def rise(self):
+        """Degrees per second the readings are rising, over the window: 0
+        until they span half of it. A slope through a few seconds of
+        readings is mostly the probe's steps of 0.11 F."""
+        points = self._readings
+        n = len(points)
+        if n < 3 or points[-1][0] - points[0][0] < self.window / 2:
+            return 0.0
+        mean_t = sum(t for t, _ in points) / n
+        mean_x = sum(x for _, x in points) / n
+        spread = sum((t - mean_t) ** 2 for t, _ in points)
+        if spread <= 0:
+            return 0.0
+        return sum((t - mean_t) * (x - mean_x) for t, x in points) / spread
+
+    def output(self, reading, target, integrate=True):
+        """The element's power for this pass, 0 to max_output."""
+        self._t += self.sample
+        self._readings.append((self._t, reading))
+        oldest = self._t - self.window
+        self._readings = [p for p in self._readings if p[0] >= oldest]
+        error = target - reading
+        into_rail = ((self.last_output >= self.max_output and error > 0)
+                     or (self.last_output <= 0 and error < 0))
+        if integrate and abs(error) <= self.band and not into_rail:
+            self.integral += self.ki * self.sample * error
+            self.integral = min(self.max_output, max(0.0, self.integral))
+        out = self.kp * error + self.integral - self.kd * self.rise()
+        self.last_output = min(self.max_output, max(0.0, out))
+        return self.last_output
 
 
 def _boiling_in(settings, unit):

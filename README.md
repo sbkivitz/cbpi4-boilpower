@@ -2,7 +2,8 @@
 
 A boil kettle logic for CraftBeerPi 4. Full power until the wort boils, then a
 fixed element duty the brewer sets from the dashboard. Give the kettle a target
-below the boil, such as 170 °F for a hop stand, and it holds that instead.
+below the boil, such as 170 °F for a hop stand or 150 °F for a mash in a bag,
+and a PID holds it there instead.
 
 > ## ⚠️ Read before you run this
 >
@@ -40,7 +41,7 @@ The kettle's target says which job it has, as on any kettle:
 
 ```
 no target, or one at the boil   ->  boil, as above
-a target below the boil         ->  hold it there
+a target below the boil         ->  hold it there with a PID
 ```
 
 "At the boil" means within 2 °C / 3.6 °F of `Boil_Threshold`, or above it, so
@@ -50,8 +51,9 @@ where your wort boils.
 
 ## What it deliberately does not do
 
-This is a dumb power controller. It has no temperature policy beyond the single
-threshold comparison, and that is a decision rather than an omission.
+This is a dumb power controller. Beyond the threshold comparison, and the PID
+that holds a target below the boil, it has no temperature policy, and that is a
+decision rather than an omission.
 
 It briefly had a maximum-temperature cut and a rate-of-rise dry-fire watch.
 Both were removed, because **a dry kettle's probe sits in air**. Air couples
@@ -244,24 +246,37 @@ the HLT's PIDBoil has always treated a target below its own threshold. Scott,
 10 Nov: "Set the boil kettle's target to 170 °F, like the HLT, and it holds
 there".
 
-## Holding below the boil: whirlpool or hop stand
+## Holding below the boil: a mash in a bag, a whirlpool, a hop stand
 
-Set the kettle's target below the boil, for example 170 °F, and it holds the
-wort there instead of boiling it. Below the target it heats, and at the target
-it switches off. Once there, it rests until the wort falls more than
-2 °C / 3.6 °F below, then heats again. Set the target back to the boil to boil.
+Set the kettle's target below the boil, for example 170 °F for a hop stand or
+150 °F for a mash in a bag, and it holds the wort there instead of boiling it.
+A PID sets the element's power, up to `Max_Output`. There is nothing to switch
+on: any target below the boil is held this way. Scott, 13 Nov, holding 150 °F
+on the simulator: "I think the boilPower should also be able to do PID
+control", then "I think this behavior should be automatic".
 
-How hard it heats depends on how far below the target the wort is. More than
-4 °C / 7.2 °F below, for example a whirlpool that cooled too far, it heats at
-`Max_Output`. Closer than that, the power eases off in proportion and reaches
-`Hold_Power` at the target. With the defaults (100% and 30%) it heats at 98%
-7 °F short, 68% 4 °F short and 39% 1 °F short. That's what the P part of a PID
-does, with no settings of its own to tune. On a simulated 40 litre kettle with
-a 5500 W element, heating back from 156 °F reached 168 °F in about 5½ minutes
-and 170 °F in about 9, without going past 170 °F. It never runs at full power
-within 7.2 °F of the hold, and at the target it is at `Hold_Power`, so it
-carries the wort no further past the hold than a flat `Hold_Power` did. Raise
-`Hold_Power` if your kettle loses a lot of heat.
+The PID works as PIDBoil's does, with two changes for a probe that reads a
+minute or so behind the wort:
+
+- **P**: 14% of the element for each °F below the target (25.2 per °C). More
+  than about 7 °F short, for example a whirlpool that cooled too far, it heats
+  at full power.
+- **I** makes up what the kettle loses to the room. It builds up only within
+  5 °F / 2.8 °C of the target, and not while the heat is paused, so a climb
+  from cold doesn't carry the wort past the target.
+- **D** eases off as the wort rises, judged by how fast the readings rose over
+  the last minute, so a probe that lags the wort doesn't let the climb run on
+  past the target.
+
+The defaults were chosen on cbpi4-simvessel's model of two kettles: the
+simulators' (40 litres, 5500 W) and one built from measurements of Scott's rig
+(RIG-NOTES 27.6). From 65 °F the rig's model passes 150 °F by 0.8 °F, then
+holds it within 0.1 °F; with a probe twice as slow, as a bag of grain might
+make it, it passes it by 1.4 °F. A whirlpool chilled to 158 °F is back within
+2 °F of 170 °F in about 5 minutes on the rig's model and 7 on the simulators',
+passing 170 °F by no more than 0.75 °F. The real rig hasn't run it yet. A kettle
+that behaves very differently may want its own `P`, `I` and `D`; the PID
+AutoTune plugin's results fit them.
 
 - The hold is the kettle's target, so it is kept like any target: set it
   while the kettle is off, switch the kettle on, and the kettle holds rather
@@ -292,7 +307,11 @@ Until 0.0.3.post7 a hold was the `Hold_Target` setting, set with a **Hold a
 temperature** action; a restart clears one left in a kettle's settings. That
 action had to go: the Set Target Temp dialog sends every action with its value
 in force, so a hold kept apart from the target would undo the target its own
-slider had just set.
+slider had just set. Until 0.0.3.post8 a hold eased from `Max_Output` down to
+a `Hold_Power` setting (30%) as the wort neared its target, switched off at
+the target, and rested until the wort fell 3.6 °F below, so it sat up to 4 °F
+under its target. `Hold_Power` is no longer used; a kettle that still has it
+ignores it.
 
 ## Properties
 
@@ -300,8 +319,10 @@ slider had just set.
 |---|---|---|
 | `Boil_Threshold` | 99 °C / 210.2 °F | Where the kettle boils: full power below, fixed duty from it. A target within 2 °C / 3.6 °F of it, or above, means boil |
 | `Boil_Power` | 85 | Element duty once boiling, 0–100 % |
-| `Max_Output` | 100 | Element duty while heating up |
-| `Hold_Power` | 30 | Element duty a hold settles to at its target, 0–100 %; below, it eases up towards `Max_Output` |
+| `Max_Output` | 100 | Element duty while heating up to the boil, and the most a hold's PID uses |
+| `P` | blank: 25.2 per °C / 14 per °F | A hold's PID: % of power per degree below the target |
+| `I` | blank: 0.054 per °C / 0.03 per °F | % of power per degree per second below the target, built up only within 2.8 °C / 5 °F of it |
+| `D` | blank: 1620 per °C / 900 per °F | % of power taken off per degree per second the wort rises. 0 turns it off |
 | `SampleTime` | 5 | Seconds between control decisions |
 | `Keep_Boiling` | Yes | Yes: full power brings the wort back to the boil. No: once boiled, only `Boil_Power` |
 | `Usual_Boil_Power` | blank | The boil power each recipe starts at; blank leaves `Boil_Power` alone |
@@ -334,6 +355,9 @@ path** so a run can never pass against a stale installed copy.
 `test_boilpower_brewday_controls.py` covers keep it at the boil, the pause and
 its warning, the usual boil power and boil at (64 checks), and
 `test_boilpower_hold_kept.py` and `test_boilpower_whirlpool.py` the hold.
+`test_boilpower_pid_hold.py` runs the hold's PID on the two modelled kettles,
+heated by the power it commands, and `test_e2e_whirlpool_hold.py` runs a
+whirlpool's hold on a full server.
 
 Two notes on what that suite is worth. It models the actor as real state that
 the commands mutate, because an earlier harness stubbed the commands as pure
