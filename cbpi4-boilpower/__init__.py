@@ -9,8 +9,8 @@ case at the end of a PID; this plugin is that case on its own:
     below the boil point (Boil_Threshold)   ->  Max_Output, get there
     at or above it                          ->  Boil_Power, hold that duty
 
-The kettle's target says which job it has, as on any kettle (Scott, 10 Nov:
-"Set the boil kettle's target to 170 F, like the HLT, and it holds there"):
+The kettle's target says which job it has, as on any kettle - set the boil
+kettle's target to 170 F, like the HLT's, and it holds there:
 
     no target, or one at the boil   ->  boil, as above
     a target below the boil         ->  hold it with a PID: a mash in a bag,
@@ -19,9 +19,9 @@ The kettle's target says which job it has, as on any kettle (Scott, 10 Nov:
 "At the boil" is within BOIL_EXIT_DROP_C of Boil_Threshold or above, so a Boil
 step's 210 F or 212 F means boil wherever the threshold sits. Boil_Threshold is
 the one place the boil point is set - at altitude, set it to where your wort
-boils - and the kettle's target no longer moves it. Until 0.0.3.post7 the
-target WAS the boil point, and a hold was a separate Hold_Target setting; that
-is gone, and a restart clears one left in a kettle's settings.
+boils - and the kettle's target does not move it. In versions before
+0.0.3.post7 the target is the boil point, and a hold is a separate Hold_Target
+setting; a restart clears a Hold_Target left in a kettle's settings.
 
 The duty is adjustable while the boil runs, through the Set Boil Power action,
 because the alternative is unusable. Editing a kettle property calls
@@ -84,7 +84,7 @@ except ImportError:  # pragma: no cover - depends on the host installation
 
 
 #: The forgotten-pause warning (BoilPower.PAUSE_WARN_AFTER_S): a title and its
-#: message, in the dashboard agent's words, after "HLT pump still running".
+#: message, worded like "HLT pump still running".
 #: Kept on every page until OK, or until the heat carries on or AUTO stops. No
 #: button heats: on the brew-day screen heat only comes on with a held press,
 #: on the element button, which reads PAUSED while the heat is paused.
@@ -189,14 +189,11 @@ class BoilPower(CBPiKettleLogic):
     # default here.
     BOIL_EXIT_DROP_C = 2.0
 
-    # The PID that holds a target below the boil (_HoldPID). Until 0.0.3.post8
-    # a hold heated at a power that eased off as the wort neared its target,
-    # switched off at the target and rested until the wort was 3.6 F below,
-    # so a hold sat up to 4 F under its target. Scott, 13 Nov, holding 150 F
-    # for a mash in a bag: "I think the boilPower should also be able to do
-    # PID control", then "add a switch or checkbox as a last resort, I think
-    # this behavior should be automatic". So a hold is simply PID control,
-    # with nothing to choose it.
+    # The PID that holds a target below the boil (_HoldPID). Any hold is PID
+    # control, with nothing to choose it: a mash in a bag held at 150 F needs
+    # tight regulation. Versions before 0.0.3.post8 heat at a power that eases
+    # off as the wort nears its target, switch off at the target and rest
+    # until the wort is 3.6 F below, so a hold sits up to 4 F under its target.
     #
     # Gains as PIDBoil's, which are PIDArduino's: % of the element per degree
     # below the target, per degree-second, and per degree-per-second of rise,
@@ -229,9 +226,9 @@ class BoilPower(CBPiKettleLogic):
     DERIVATIVE_WINDOW_S = 60.0
 
     # How long the heat may stay paused before the brewer is warned, in
-    # brewing seconds. Scott, 10 Nov: a forgotten pause gets a warning on every
-    # page after 2 minutes. A boil-over is dealt with in seconds; two minutes
-    # off is a boil going cold with nobody watching.
+    # brewing seconds: a forgotten pause gets a warning on every page after 2
+    # minutes. A boil-over is dealt with in seconds; two minutes off is a boil
+    # going cold with nobody watching.
     PAUSE_WARN_AFTER_S = 120
 
     # Keep_Boiling values that mean No. Anything else - including a kettle set
@@ -287,8 +284,8 @@ class BoilPower(CBPiKettleLogic):
 
         `default` is returned unchanged when the value cannot be read, so a
         caller can pass None to mean "tell me it was unreadable" rather than
-        being handed a number it did not ask for. int(None) used to raise here,
-        which made that impossible.
+        being handed a number it did not ask for: None is returned as it is,
+        not passed to int(), which would raise.
         """
         def fallback():
             return default if default is None else int(default)
@@ -326,12 +323,11 @@ class BoilPower(CBPiKettleLogic):
     def _keep_boiling(self):
         """Keep_Boiling, read fresh each pass: True unless it says No.
 
-        Yes is today's boil: the latch lets go when the wort falls
+        Yes is the usual boil: the latch lets go when the wort falls
         BOIL_EXIT_DROP_C below the boil, and full power brings it back. No
         keeps the latch once the wort has boiled, so Boil_Power alone drives
-        it. Scott, 10 Nov, who had set 2% and watched the kettle cycle between
-        full power and 2%: "let the boil power fully drive the temp (ok to fall
-        if I set it too low %)".
+        it, and the wort may fall if the power is set low, rather than the
+        kettle cycling between full power and, say, 2%.
         """
         raw = self.props.get("Keep_Boiling", "Yes")
         return str(raw).strip().lower() not in self._NO
@@ -420,8 +416,8 @@ class BoilPower(CBPiKettleLogic):
             value = float(self.get_kettle_target_temp(self.id) or 0)
         except Exception:  # noqa: BLE001
             # Broad on purpose: this calls into the core, and through it into
-            # whatever is registered. Anything raised here used to escape the
-            # control loop, which then died silently with the interface still
+            # whatever is registered. Anything raised here would escape the
+            # control loop, which would die silently with the interface still
             # showing the logic running.
             logging.warning("BoilPower: could not read the kettle's target")
             return None
@@ -433,8 +429,8 @@ class BoilPower(CBPiKettleLogic):
         """The temperature to hold, or None for a boil.
 
         The kettle's target, when it is more than exit_drop below the boil
-        point `threshold`. Scott, 10 Nov: "Set the boil kettle's target to
-        170 F, like the HLT, and it holds there". The HLT's PIDBoil works the
+        point `threshold`: set the boil kettle's target to 170 F, like the
+        HLT's, and it holds there. The HLT's PIDBoil works the
         same way: it holds any target, and switches to its boil power only once
         the wort reaches its own Boil_Threshold.
 
@@ -443,11 +439,10 @@ class BoilPower(CBPiKettleLogic):
         is no target at all. A hold that close to boiling could not be told
         apart from a boil, and the hold's own band would put it at the boil.
 
-        This reverses a decision. Until 0.0.3.post7 the target WAS the boil
-        point, so "my boil is at 205" - at altitude, or for a gentler boil -
-        was said with the target, and a hold had to be asked for separately,
-        through Hold_Target. Boil_Threshold says where the boil is now, and a
-        gentler boil is Boil_Power.
+        Boil_Threshold says where the boil is, and a gentler boil is
+        Boil_Power. (In versions before 0.0.3.post7 the target is the boil
+        point, so "my boil is at 205" is said with the target, and a hold is
+        asked for separately, through Hold_Target.)
         """
         target = self._target()
         if target is None or target >= threshold - exit_drop:
@@ -458,20 +453,19 @@ class BoilPower(CBPiKettleLogic):
         """Where full power ends and the boil power begins: the boil point,
         Boil_Threshold, read fresh each pass. Never raises.
 
-        It used to be the kettle's target when there was one, so the target
-        was the boil point. Now the target says boil or hold (_hold_target),
-        and only Boil_Threshold moves the boil point - set it with Boil at,
-        running or not.
+        The kettle's target says boil or hold (_hold_target); only
+        Boil_Threshold moves the boil point - set it with Boil at, running or
+        not.
         """
         return self._configured_boiling()
 
     # A vessel this far above boiling is dry, whatever the setpoint says.
     #
-    # The default used to be Boil_Threshold + 15C, which is wrong in a way that
-    # would ruin a brew day: it trips whenever the kettle legitimately runs
-    # hotter than its own threshold. Set a 77C/170F hop stand and then bring
-    # the same kettle to a boil and the guard fires on a perfectly healthy
-    # boil, killing the element and stopping the logic.
+    # Not Boil_Threshold + 15C, which would ruin a brew day: it trips whenever
+    # the kettle legitimately runs hotter than its own threshold. Set a
+    # 77C/170F hop stand and then bring the same kettle to a boil, and that
+    # guard fires on a perfectly healthy boil, killing the element and
+    # stopping the logic.
     #
     # Water cannot exceed its boiling point by any margin while there is water
     # in it - the energy goes into vapour, not temperature - so a reading well
@@ -485,10 +479,10 @@ class BoilPower(CBPiKettleLogic):
         a local variable is wrong the moment anything else touches the actor -
         and on a rig, the brewer is something else that touches the actor.
 
-        The third value is the one that matters for safety. This used to return
-        (False, None) both when the actor was genuinely off and when it could
-        not be read at all, and the caller cannot tell those apart: "off" means
-        command it on, so an unreadable actor made the loop re-issue actor_on()
+        The third value is the one that matters for safety. Given (False,
+        None) both when the actor is genuinely off and when it cannot be read
+        at all, the caller could not tell those apart: "off" means command it
+        on, so an unreadable actor would make the loop re-issue actor_on()
         every single pass, for ever.
 
         That is not a cosmetic difference. GPIOActor implements its duty cycle
@@ -561,10 +555,8 @@ class BoilPower(CBPiKettleLogic):
         """Say something to the brewer, and write it down.
 
         PIDBoil logs a message and then notifies it, so anything a brewer was
-        told can be found afterwards. This plugin only notified, and the gap
-        showed the first time it mattered: asked what warning had stopped a
-        brew day, there was nothing in the log to answer with - the message had
-        to be reconstructed from arithmetic on the current settings.
+        told can be found afterwards. A notification alone leaves nothing in
+        the log to say which warning stopped a brew day.
 
         One call does both, so the two cannot drift apart.
         """
@@ -663,12 +655,12 @@ class BoilPower(CBPiKettleLogic):
         # An unreadable value leaves the duty alone rather than falling back to
         # the class default.
         #
-        # It used to clamp to DEFAULT_BOIL_POWER, so clearing the field while
-        # boiling at 20% and pressing Set asked for 85% - a large, silent
-        # increase in boil vigour from an incomplete edit, which is a boilover
-        # rather than a typo. A default is the right answer for a property that
-        # has never been configured, and the wrong one for a live command that
-        # arrived malformed.
+        # Clamped to DEFAULT_BOIL_POWER, clearing the field while boiling at
+        # 20% and pressing Set would ask for 85% - a large, silent increase in
+        # boil vigour from an incomplete edit, which is a boilover rather than
+        # a typo. A default is the right answer for a property that has never
+        # been configured, and the wrong one for a live command that arrived
+        # malformed.
         requested = self._clamp_percent(Boil_Power, None)
         if requested is None:
             self._tell(
@@ -840,7 +832,7 @@ class BoilPower(CBPiKettleLogic):
         carry on heating.
 
         For a boil-over. AUTO, the boil latch, Boil_Power and the recipe's
-        timer carry on (Scott, 10 Nov: the boil's timer keeps counting); only
+        timer carry on (the boil's timer keeps counting); only
         the element stays off, until Paused is No. Carrying on goes back to
         what AUTO does by then: the boil power once boiling, full power below,
         or the hold. MANUAL or ALL OFF, which stop this logic, end a pause too.
@@ -957,14 +949,13 @@ class BoilPower(CBPiKettleLogic):
         try:
             # Resolve the hardware and establish a known state first.
             #
-            # This used to parse the sample time, threshold and max output
-            # before touching the kettle, so anything that raised in there -
-            # and Boil_Threshold is a free-text property a brewer can type
-            # anything into - escaped before self.heater existed. Both cleanup
-            # paths are guarded on that attribute, so they skipped the
-            # de-energize, and a failed start left an element that was already
-            # on running with no logic behind it. Nothing in the interface said
-            # so; the kettle simply showed as stopped.
+            # Parsing the sample time, threshold and max output first would
+            # let anything that raised in there - and Boil_Threshold is a
+            # free-text property a brewer can type anything into - escape
+            # before self.heater existed. Both cleanup paths are guarded on
+            # that attribute, so they would skip the de-energize, and a failed
+            # start would leave an element that was already on running with no
+            # logic behind it, the kettle simply showing as stopped.
             #
             # Nothing below this point is needed to switch a heater off, so
             # nothing below this point runs before it.
@@ -1006,13 +997,12 @@ class BoilPower(CBPiKettleLogic):
             # question it asks about temperature is which of those two it is
             # in.
             #
-            # It previously carried two safety guards - an over-temperature
-            # ceiling and a stall watch - and both were removed. Each ruined a
-            # brew day by cutting the element on a healthy kettle, and neither
-            # belongs here: a limit that stops heating is a policy about the
-            # vessel, not about how hard to boil it, and burying it in a power
-            # controller means every logic has to reimplement it and get it
-            # wrong separately. Those limits belong in a layer that owns them.
+            # It carries no over-temperature ceiling or stall watch. Each cuts
+            # the element on a healthy kettle, and neither belongs here: a
+            # limit that stops heating is a policy about the vessel, not about
+            # how hard to boil it, and burying it in a power controller means
+            # every logic has to reimplement it and get it wrong separately.
+            # Those limits belong in a layer that owns them.
 
             # Publish a setpoint if there is none, so the dashboard has
             # something to show. Without this the SV widget read 0 and a
@@ -1077,10 +1067,10 @@ class BoilPower(CBPiKettleLogic):
                 # described and then answered backwards.
                 #
                 # Held with a PID (_HoldPID), as the HLT's PIDBoil holds its
-                # target. Until 0.0.3.post8 it was bang-bang - "a hop stand
-                # wants do not fall below, not tight regulation" - and a mash
-                # does want tight regulation: the hold sat up to 4 F under its
-                # target (Scott, 13 Nov).
+                # target: a hop stand only needs not to fall below, but a mash
+                # wants tight regulation, and switching the element on and off
+                # (as versions before 0.0.3.post8 do) sits up to 4 F under the
+                # target.
                 #
                 # Read every pass, so a target changed mid-boil - by the
                 # brewer, or a Whirlpool step's Heat and hold - takes over at
@@ -1333,8 +1323,8 @@ def _clear_kettle_hold(kettle, unit="C"):
     """Clear the hold kept with `kettle`.
 
     A hold is the kettle's target, below where it boils: put back to the boil
-    point. And a Hold_Target setting left from before 0.0.3.post7, when a hold
-    was kept apart from the target, is cleared too - in the kettle's settings
+    point. And a Hold_Target setting left by a version before 0.0.3.post7, which
+    keeps a hold apart from the target, is cleared too - in the kettle's settings
     and in any BoilPower settings put aside while it runs another logic.
 
     (the hold that was in force or None, whether anything was changed)."""
@@ -1407,13 +1397,12 @@ def _tell_hold_cleared(cbpi, kettle_name, held):
 async def _clear_holds_after_restart(cbpi):
     """A restart of CraftBeerPi clears every BoilPower hold, and says so.
 
-    Scott, 3 Nov: "Restarts should clear the hold." A hold is kept with the
-    kettle - its target, below the boil - so that switching the kettle off and
-    on keeps it. A restart is different: the server may have been down for
-    minutes or a night, and a hold left in the kettle's target waits for the
-    next time the kettle is switched on - perhaps the next brew. So a restart
-    puts the target back to the boil, and the brewer is told which hold went,
-    in time to set it again.
+    A hold is kept with the kettle - its target, below the boil - so that
+    switching the kettle off and on keeps it. A restart is different: the
+    server may have been down for minutes or a night, and a hold left in the
+    kettle's target waits for the next time the kettle is switched on -
+    perhaps the next brew. So a restart puts the target back to the boil, and
+    the brewer is told which hold went, in time to set it again.
 
     A start-up hook: run once everything is loaded, before any page can
     connect. Never raises - a hook that raised would stop CraftBeerPi starting.
@@ -1483,10 +1472,9 @@ async def _usual_power_for_the_recipe(cbpi):
     """Each BoilPower kettle with a Usual_Boil_Power: Boil_Power back to it,
     and said, as the recipe starts. Never raises.
 
-    Scott, 10 Nov: each recipe starts at the usual boil power - his choice, of
-    "each boil starts at your usual power", moved to the recipe's start so a
-    power set during the sparge or the "Ready to boil?" hold is kept for that
-    boil. Said only when it changes something.
+    Each recipe starts at the usual boil power - at the recipe's start, not
+    the boil's, so a power set during the sparge or the "Ready to boil?" hold
+    is kept for that boil. Said only when it changes something.
     """
     told = []
     try:

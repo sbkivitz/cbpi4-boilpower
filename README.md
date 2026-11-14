@@ -242,18 +242,15 @@ so the setpoint widget never reads zero.
 Until 0.0.3.post7 this logic read the target as the boil threshold, so a low
 setpoint meant "my boil is here", and a hold was a separate setting. Now
 `Boil_Threshold` says where the boil is, and the target says boil or hold, as
-the HLT's PIDBoil has always treated a target below its own threshold. Scott,
-10 Nov: "Set the boil kettle's target to 170 °F, like the HLT, and it holds
-there".
+the HLT's PIDBoil has always treated a target below its own threshold: set the
+boil kettle's target to 170 °F, like the HLT's, and it holds there.
 
 ## Holding below the boil: a mash in a bag, a whirlpool, a hop stand
 
 Set the kettle's target below the boil, for example 170 °F for a hop stand or
 150 °F for a mash in a bag, and it holds the wort there instead of boiling it.
 A PID sets the element's power, up to `Max_Output`. There is nothing to switch
-on: any target below the boil is held this way. Scott, 13 Nov, holding 150 °F
-on the simulator: "I think the boilPower should also be able to do PID
-control", then "I think this behavior should be automatic".
+on: any target below the boil is held this way.
 
 The PID works as PIDBoil's does, with two changes for a probe that reads a
 minute or so behind the wort:
@@ -269,7 +266,7 @@ minute or so behind the wort:
   past the target.
 
 The defaults were chosen on cbpi4-simvessel's model of two kettles: the
-simulators' (40 litres, 5500 W) and one built from measurements of Scott's rig
+simulators' (40 litres, 5500 W) and one built from measurements of the real rig
 (RIG-NOTES 27.6). From 65 °F the rig's model passes 150 °F by 0.8 °F, then
 holds it within 0.1 °F; with a probe twice as slow, as a bag of grain might
 make it, it passes it by 1.4 °F. A whirlpool chilled to 158 °F is back within
@@ -301,8 +298,9 @@ boiled at full power. From 0.0.3.post3 a restart clears a hold. Until
 0.0.3.post4 a hold never climbed: far below its target it heated at
 `Hold_Power` too. Until 0.0.3.post6 it dropped to a flat `Hold_Power` 7.2 °F
 short of the target, which only just beats a kettle's losses, so the last few
-degrees crawled. Scott, 4 Nov: "I don't think if I'm attempting to heat back up
-from where I over-cooled, I should be forced to use the hold_power value".
+degrees crawled. The brewer, 4 Nov: "I don't think if I'm attempting to heat
+back up from where I over-cooled, I should be forced to use the hold_power
+value".
 Until 0.0.3.post7 a hold was the `Hold_Target` setting, set with a **Hold a
 temperature** action; a restart clears one left in a kettle's settings. That
 action had to go: the Set Target Temp dialog sends every action with its value
