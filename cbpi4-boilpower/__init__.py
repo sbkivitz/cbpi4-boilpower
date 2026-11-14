@@ -191,9 +191,8 @@ class BoilPower(CBPiKettleLogic):
 
     # The PID that holds a target below the boil (_HoldPID). Any hold is PID
     # control, with nothing to choose it: a mash in a bag held at 150 F needs
-    # tight regulation. Versions before 0.0.3.post8 heat at a power that eases
-    # off as the wort nears its target, switch off at the target and rest
-    # until the wort is 3.6 F below, so a hold sits up to 4 F under its target.
+    # tight regulation. Switching off at the target and resting until the
+    # wort is 3.6 F below would leave a hold up to 4 F under its target.
     #
     # Gains as PIDBoil's, which are PIDArduino's: % of the element per degree
     # below the target, per degree-second, and per degree-per-second of rise,
@@ -1069,8 +1068,7 @@ class BoilPower(CBPiKettleLogic):
                 # Held with a PID (_HoldPID), as the HLT's PIDBoil holds its
                 # target: a hop stand only needs not to fall below, but a mash
                 # wants tight regulation, and switching the element on and off
-                # (as versions before 0.0.3.post8 do) sits up to 4 F under the
-                # target.
+                # sits up to 4 F under the target.
                 #
                 # Read every pass, so a target changed mid-boil - by the
                 # brewer, or a Whirlpool step's Heat and hold - takes over at
