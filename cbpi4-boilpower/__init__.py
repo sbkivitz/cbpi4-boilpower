@@ -644,8 +644,8 @@ class BoilPower(CBPiKettleLogic):
         matches a configured property. A field that opens empty and is then
         submitted writes a power of nothing.
 
-        `Power` is still accepted, because an earlier version of this plugin
-        declared it under that name and something may still be calling it.
+        `Power` is still accepted, because older versions of this plugin
+        declare it under that name and something may still be calling it.
         """
         if Boil_Power is None:
             Boil_Power = Power
@@ -675,13 +675,13 @@ class BoilPower(CBPiKettleLogic):
 
         # Persist it, so the interface and the element agree.
         #
-        # This deliberately did not save, on the reasoning that adjusting
-        # vigour for one batch should not rewrite the recipe. That was wrong in
-        # practice: the dashboard slider seeds from Boil_Power, so it kept
-        # opening at the stored 85 while the element was actually running at
-        # 10, and the brewer had no way to see the value in force. A control
-        # surface that disagrees with the hardware is worse than one that
-        # remembers a number you can change back.
+        # Not saving, so that adjusting vigour for one batch leaves the recipe
+        # alone, is wrong in practice: the dashboard slider seeds from
+        # Boil_Power, so it would keep opening at the stored 85 while the
+        # element is actually running at 10, and the brewer would have no way
+        # to see the value in force. A control surface that disagrees with the
+        # hardware is worse than one that remembers a number you can change
+        # back.
         #
         # save() only writes the file and pushes an update - unlike update(),
         # it does not stop the logic - so this is safe during a boil.
@@ -1154,18 +1154,17 @@ class BoilPower(CBPiKettleLogic):
                 # Drive the actor from what it IS doing, not from what this loop
                 # last told it to do.
                 #
-                # These were tracked in locals - heater_is_on, heat_percent_old
-                # - and commanded only on a believed transition. Switch the
-                # element off from the dashboard and the loop still believed it
-                # was on, so it never commanded again: the element stayed dark
-                # while the logic went on thinking it was driving it, until the
-                # brewer stopped and restarted the automation.
+                # A loop that tracks heater_is_on and heat_percent_old in locals
+                # and commands only on a believed transition goes wrong the
+                # moment the element is switched off from the dashboard: it
+                # still believes the element is on, so it never commands again,
+                # and the element stays dark while the logic thinks it is
+                # driving it, until the brewer stops and restarts the automation.
                 #
-                # That is the same desync ActorController.off had, where acting
-                # only when the software believed the actor was already on made
-                # switching off a no-op exactly when it was needed. Belief about
-                # hardware goes stale the moment anything else touches it, and
-                # on a rig the brewer is something else that touches it.
+                # Acting only when the software believes the actor is already on
+                # makes switching off a no-op exactly when it is needed. Belief
+                # about hardware goes stale the moment anything else touches it,
+                # and on a rig the brewer is something else that touches it.
                 #
                 # Reading the actor costs one dictionary lookup per control
                 # decision and cannot go stale.
