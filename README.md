@@ -329,6 +329,12 @@ ignores it.
 | `Keep_Boiling` | Yes | Yes: full power brings the wort back to the boil. No: once boiled, only `Boil_Power` |
 | `Usual_Boil_Power` | blank | The boil power each recipe starts at; blank leaves `Boil_Power` alone |
 
+Each property's Default is what the logic uses when it is left empty, in the
+server's temperature unit. The logic tells CraftBeerPi these values
+(`blank_defaults`), so the Hardware page can show them and offer to fill them
+in. `Usual_Boil_Power` has none: empty, it leaves `Boil_Power` alone, which no
+number can say.
+
 The logic also keeps `Paused` and `Paused_At` in a kettle's settings while the
 heat is paused. They are not settings to edit: a start, a stop and a restart
 clear them.
@@ -359,7 +365,9 @@ its warning, the usual boil power and boil at (64 checks), and
 `test_boilpower_hold_kept.py` and `test_boilpower_whirlpool.py` the hold.
 `test_boilpower_pid_hold.py` runs the hold's PID on the two modelled kettles,
 heated by the power it commands, and `test_e2e_whirlpool_hold.py` runs a
-whirlpool's hold on a full server.
+whirlpool's hold on a full server. `test_blank_defaults.py` checks that each
+value `blank_defaults` gives is what the logic does with that property empty,
+in °C and in °F.
 
 Two notes on what that suite is worth. It models the actor as real state that
 the commands mutate, because an earlier harness stubbed the commands as pure

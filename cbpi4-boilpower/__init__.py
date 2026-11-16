@@ -167,6 +167,7 @@ class BoilPower(CBPiKettleLogic):
     DEFAULT_BOIL_POWER = 85
     DEFAULT_MAX_OUTPUT = 100
     DEFAULT_SAMPLE_TIME = 5
+    DEFAULT_KEEP_BOILING = "Yes"
 
     # Floor for SampleTime. GPIOActor derives its on-phase from this value, and
     # at zero neither branch of its duty cycle sleeps - which starves the event
@@ -257,10 +258,37 @@ class BoilPower(CBPiKettleLogic):
     def _unit(self):
         return str(self.get_config_value("TEMP_UNIT", "C")).upper()
 
+    @staticmethod
+    def _celsius(unit):
+        """Whether `unit` is Celsius: anything starting with C is."""
+        return str(unit).strip().upper().startswith("C")
+
+    @classmethod
+    def blank_defaults(cls, unit):
+        """What this logic uses for each setting left empty, in `unit` ("C" or
+        "F"). The control loop, the actions and the restart hooks take their
+        defaults from here or from the same DEFAULT_ constants, so the two
+        can't drift apart.
+
+        Usual_Boil_Power is left out: empty, it leaves Boil_Power as the
+        brewer left it, which no number can say.
+        """
+        celsius = cls._celsius(unit)
+        ratio = 1.0 if celsius else 1.8
+        return {
+            "Boil_Threshold": (cls.DEFAULT_THRESHOLD_C if celsius
+                               else cls.DEFAULT_THRESHOLD_C * 9.0 / 5.0 + 32.0),
+            "Boil_Power": cls.DEFAULT_BOIL_POWER,
+            "Max_Output": cls.DEFAULT_MAX_OUTPUT,
+            "P": cls.DEFAULT_P_C / ratio,
+            "I": cls.DEFAULT_I_C / ratio,
+            "D": cls.DEFAULT_D_C / ratio,
+            "SampleTime": cls.DEFAULT_SAMPLE_TIME,
+            "Keep_Boiling": cls.DEFAULT_KEEP_BOILING,
+        }
+
     def _default_threshold(self):
-        if self._unit() == "C":
-            return self.DEFAULT_THRESHOLD_C
-        return self.DEFAULT_THRESHOLD_C * 9.0 / 5.0 + 32.0
+        return self.blank_defaults(self._unit())["Boil_Threshold"]
 
     def _sample_time(self):
         """Seconds between control decisions. Never raises.
@@ -351,7 +379,7 @@ class BoilPower(CBPiKettleLogic):
         it, and the wort may fall if the power is set low, rather than the
         kettle cycling between full power and, say, 2%.
         """
-        raw = self.props.get("Keep_Boiling", "Yes")
+        raw = self.props.get("Keep_Boiling", self.DEFAULT_KEEP_BOILING)
         return str(raw).strip().lower() not in self._NO
 
     async def _keep_setting(self, name, value):
@@ -395,22 +423,20 @@ class BoilPower(CBPiKettleLogic):
         setting, else the default. Never raises.
 
         A setting is taken as entered, in the unit the server runs in, as
-        PIDBoil takes its own; a default is Celsius and converted. A blank,
-        unreadable, infinite or negative setting is the default - a negative
-        gain would heat the wort harder the further it rose past its target.
-        0 is a setting: no D, say.
+        PIDBoil takes its own; a default is blank_defaults()'s, Celsius and
+        converted. A blank, unreadable, infinite or negative setting is the
+        default - a negative gain would heat the wort harder the further it
+        rose past its target. 0 is a setting: no D, say.
         """
-        ratio = self._degree_ratio()
+        blank = self.blank_defaults(self._unit())
         gains = []
-        for label, celsius in (("P", self.DEFAULT_P_C),
-                               ("I", self.DEFAULT_I_C),
-                               ("D", self.DEFAULT_D_C)):
+        for label in ("P", "I", "D"):
             try:
                 value = float(self.props.get(label))
             except (TypeError, ValueError):
                 value = None
             if value is None or not math.isfinite(value) or value < 0:
-                value = celsius / ratio
+                value = blank[label]
             gains.append(value)
         return tuple(gains)
 
@@ -1336,11 +1362,9 @@ class _HoldPID:
 
 def _boiling_in(settings, unit):
     """Where a BoilPower kettle boils: Boil_Threshold in `settings`, else
-    99 C / 210.2 F in `unit` ("C" or "F"). Never raises: it is free text."""
-    if str(unit).strip().upper().startswith("C"):
-        default = BoilPower.DEFAULT_THRESHOLD_C
-    else:
-        default = BoilPower.DEFAULT_THRESHOLD_C * 9.0 / 5.0 + 32.0
+    99 C / 210.2 F in `unit` ("C" or "F"), as BoilPower.blank_defaults()
+    says. Never raises: it is free text."""
+    default = BoilPower.blank_defaults(unit)["Boil_Threshold"]
     try:
         raw = settings.get("Boil_Threshold", None)
     except Exception:  # noqa: BLE001
