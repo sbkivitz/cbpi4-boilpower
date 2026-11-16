@@ -239,6 +239,10 @@ any kettle. Set it at or above the boil point to boil; set it below to hold.
 When the logic starts with no target, it puts the boil point in as the target,
 so the setpoint widget never reads zero.
 
+A target that isn't a number, such as NaN or infinity, is ignored, with a
+message: the kettle carries on with the target it had before, so a hold stays
+a hold and a boil stays a boil. With no target before it, the kettle boils.
+
 Until 0.0.3.post7 this logic read the target as the boil threshold, so a low
 setpoint meant "my boil is here", and a hold was a separate setting. Now
 `Boil_Threshold` says where the boil is, and the target says boil or hold, as
@@ -321,7 +325,7 @@ ignores it.
 | `P` | blank: 25.2 per °C / 14 per °F | A hold's PID: % of power per degree below the target |
 | `I` | blank: 0.054 per °C / 0.03 per °F | % of power per degree per second below the target, built up only within 2.8 °C / 5 °F of it |
 | `D` | blank: 1620 per °C / 900 per °F | % of power taken off per degree per second the wort rises. 0 turns it off |
-| `SampleTime` | 5 | Seconds between control decisions |
+| `SampleTime` | 5 | Seconds between control decisions, up to 60. More than 60, or anything that isn't a number, is 5, with a message |
 | `Keep_Boiling` | Yes | Yes: full power brings the wort back to the boil. No: once boiled, only `Boil_Power` |
 | `Usual_Boil_Power` | blank | The boil power each recipe starts at; blank leaves `Boil_Power` alone |
 

@@ -173,6 +173,11 @@ class BoilPower(CBPiKettleLogic):
     # loop rather than merely running fast.
     MIN_SAMPLE_TIME = 0.1
 
+    # The most SampleTime may be. The element stays as one decision set it
+    # until the next, so a failed sensor or a boil power turned down to 0%
+    # waits up to this long to reach it; more than a minute is not control.
+    MAX_SAMPLE_TIME = 60
+
     # Fallback only. The sensor's own cadence is preferred - see _read_temp.
     MAX_SENSOR_AGE = 30
 
@@ -242,6 +247,13 @@ class BoilPower(CBPiKettleLogic):
     _paused_since = None
     _pause_warned = None
 
+    # The kettle's target as last read when it was a number (_target), None
+    # for no target; and whether a target that is not a number has been
+    # reported, until the kettle has a number or no target again. Class
+    # defaults, as above.
+    _last_target = None
+    _target_refused = False
+
     def _unit(self):
         return str(self.get_config_value("TEMP_UNIT", "C")).upper()
 
@@ -253,23 +265,34 @@ class BoilPower(CBPiKettleLogic):
     def _sample_time(self):
         """Seconds between control decisions. Never raises.
 
-        This was a bare int(), which raises on "2.5" or on anything a human
-        might type into a free-text field - and an exception here escapes into
-        run()'s handler and kills the control loop before it has switched the
-        element off once. Every other property on this class is parsed
-        defensively; this one was the exception, for no reason.
+        SampleTime offers 2 or 5, but a fork, a hand-edited config file or an
+        API call can carry anything, so it is parsed rather than trusted. The
+        loop sleeps this long after every decision, and the element stays as
+        that decision set it: an infinite SampleTime would leave it for good.
+        So a value that is not a finite number - text, NaN, an infinity, a
+        number too big for a float - or that is more than MAX_SAMPLE_TIME is
+        the default, 5, and the brewer is told. Blank or missing is the
+        default, quietly.
 
-        Floored rather than clamped to the Select options, because a fork or a
-        hand-edited config file may legitimately carry something else. The
-        floor exists because GPIOActor derives its on-phase from this value:
-        at zero, neither branch of its duty cycle sleeps and it starves the
-        event loop.
+        A number below MIN_SAMPLE_TIME is raised to it; any other is used as
+        it is, not rounded to the choices offered.
         """
-        try:
-            seconds = float(self.props.get("SampleTime", self.DEFAULT_SAMPLE_TIME))
-        except (TypeError, ValueError):
+        raw = self.props.get("SampleTime", None)
+        if raw is None or str(raw).strip() == "":
             return self.DEFAULT_SAMPLE_TIME
-        if seconds != seconds:  # NaN
+        try:
+            seconds = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            seconds = float("nan")
+        if not math.isfinite(seconds) or seconds > self.MAX_SAMPLE_TIME:
+            shown = repr(raw)
+            if len(shown) > 24:
+                shown = shown[:21] + "..."
+            self._tell(self._kettle_name(),
+                       "SampleTime is set to {}, which is not a number of seconds "
+                       "up to {}, so {} is used instead.".format(
+                           shown, self.MAX_SAMPLE_TIME, self.DEFAULT_SAMPLE_TIME),
+                       NotificationType.WARNING)
             return self.DEFAULT_SAMPLE_TIME
         return max(self.MIN_SAMPLE_TIME, seconds)
 
@@ -406,23 +429,53 @@ class BoilPower(CBPiKettleLogic):
         """The kettle's target, a finite number above 0, else None. Read
         fresh. Never raises.
 
-        None is "no target", and BoilPower boils without one. Infinity and NaN
-        are no target either: an infinite setpoint once became a boil point
-        the wort could never reach, and the element held Max_Output for good
-        (cbpi-testbench test_safety_invariants, I5).
+        None is "no target", and BoilPower boils without one: a target that
+        is unset, blank, 0 or below.
+
+        A target that is not a number - NaN, an infinity, a number too big for
+        a float, text, or one that cannot be read at all - is not taken as no
+        target. Taken that way, a hold below the boil would end, and the
+        element would go to Max_Output for the boil. The last target that was
+        a number stands instead, so the kettle carries on as it was, and the
+        brewer is told once. With none before it, it is no target, and the
+        kettle boils at Boil_Threshold.
         """
         try:
-            value = float(self.get_kettle_target_temp(self.id) or 0)
+            raw = self.get_kettle_target_temp(self.id)
         except Exception:  # noqa: BLE001
             # Broad on purpose: this calls into the core, and through it into
             # whatever is registered. Anything raised here would escape the
             # control loop, which would die silently with the interface still
             # showing the logic running.
-            logging.warning("BoilPower: could not read the kettle's target")
-            return None
-        if not math.isfinite(value) or value <= 0:
-            return None
-        return value
+            return self._target_before("could not be read")
+        try:
+            value = float(raw or 0)
+        except (TypeError, ValueError, OverflowError):
+            value = float("nan")
+        if not math.isfinite(value):
+            shown = repr(raw)
+            if len(shown) > 24:
+                shown = shown[:21] + "..."
+            return self._target_before("is {}, which is not a temperature".format(shown))
+        self._target_refused = False
+        self._last_target = value if value > 0 else None
+        return self._last_target
+
+    def _target_before(self, why):
+        """_target's answer for a target that is not a number: the last one
+        that was, or None. Tells the brewer once, `why` saying what is wrong
+        with it, until the kettle has a number or no target again."""
+        last = getattr(self, "_last_target", None)
+        if not getattr(self, "_target_refused", False):
+            self._target_refused = True
+            if last is None:
+                after = "With no target before it, the kettle boils."
+            else:
+                after = "The target before it, {:.1f}, still stands.".format(last)
+            self._tell(self._kettle_name(),
+                       "The target {}, so it is ignored. {}".format(why, after),
+                       NotificationType.WARNING)
+        return last
 
     def _hold_target(self, threshold, exit_drop):
         """The temperature to hold, or None for a boil.
