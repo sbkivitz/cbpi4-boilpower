@@ -152,6 +152,9 @@ when given the value already in force. That matters because the dashboard's
 **Set Target Temp** dialog sends every action the logic declares, each filled
 in with its value in force, every time Set is pressed. A pause and a resume as
 two actions without settings would pause and resume the heat at every Set.
+**Heat by hand at the boil power** (below) keeps no setting and declares none:
+the dialog shows it with "Runs when you press Set.", and at a Set it does what
+**Set boil power** has just done.
 
 ### Keep it at the boil
 
@@ -193,6 +196,49 @@ kettle aiming at the boil keeps aiming at it: its target moves with the boil
 point, so raising it never turns a boil into a hold. Blank goes back to
 99 °C / 210.2 °F.
 
+### By hand: MANUAL
+
+Out of AUTO the element heats at the boil power too: one number for AUTO and
+by hand. CraftBeerPi keeps two levels for each element: the one it runs at
+now, which AUTO sets, and the brewer's own (`manual_power`), which a logic's
+commands never change. Switching the element on without a level - Brew Day's
+BOIL ELEMENT, the Hardware page's switch, `POST /actor/{id}/on` - runs it at
+the brewer's own. So while AUTO isn't running, BoilPower keeps the element's
+own level at `Boil_Power`, set as the brewer's:
+
+- as AUTO stops (MANUAL, ALL OFF), once the element is off;
+- when the boil power is set, and an element on by hand changes to it at once;
+- when a recipe's start puts back the usual boil power, at once too;
+- once as CraftBeerPi starts, whatever level `actor.json` kept.
+
+Nothing out of AUTO reads the probe, so an element on by hand heats on with a
+probe that has failed: that is how a boil is finished when AUTO can't. An
+element another kettle's AUTO is driving is left to that AUTO.
+
+**Heat by hand at the boil power** (`heat_by_hand_at_boil_power`, no
+parameter) does the same on demand: out of AUTO, the element's own level back
+to `Boil_Power`, and its power at once if it is on; with AUTO running,
+nothing. It never switches the element on. It is for a level the element was
+given some other way: `Boil_Power` changed in the kettle's form on the
+Hardware page, or a level set on the element itself.
+
+**Telling 0.0.3.post13 from an older BoilPower.** This version declares that
+action and an older one doesn't. A page reads it from the logic types
+CraftBeerPi already sends, as Brew Day reads `set_boil_power` and, from
+0.0.3.post7, `set_boil_at`: in `GET /system/`'s `kettle.types` (or
+`GET /kettle/`'s `types`), the `BoilPower` entry's `actions` hold one whose
+`method` is `heat_by_hand_at_boil_power`. The websocket's snapshot doesn't
+carry the types. With an older BoilPower the element in MANUAL heats at a
+level of its own, which changing the boil power doesn't touch, so a page
+should keep MANUAL apart from the boil power there.
+
+The cost: a power set by hand is the boil power AUTO uses next. And
+`Boil_Power` changed in the kettle's form on the Hardware page reaches the
+element's own level only at the next of those moments, or with Heat by hand at
+the boil power. On a CraftBeerPi before 4.7.7.post34, which keeps one level
+for each element, an element switched on without a level comes on at the one
+it last ran at, which this sets too.
+
 ## Timing
 
 Deliberately identical to PIDBoil rather than invented. The loop runs on
@@ -218,6 +264,8 @@ behave as they are configured to.
   does not cycle the element every minute.
 - `on_stop()` and the `finally` block both switch the heater off, so a
   cancelled task cannot leave the element energized.
+- Out of AUTO the element's own level is set with `set_power`, which never
+  switches an element on; leaving AUTO switches the element off first.
 - Duty is clamped to 0–100 and never raises on a malformed value.
 - The element is driven from **what the actor reports**, not from what the loop
   last commanded. Switch the heater off from the dashboard mid-boil and the
@@ -320,7 +368,7 @@ ignores it.
 | Property | Default | Meaning |
 |---|---|---|
 | `Boil_Threshold` | 99 °C / 210.2 °F | Where the kettle boils: full power below, fixed duty from it. A target within 2 °C / 3.6 °F of it, or above, means boil |
-| `Boil_Power` | 85 | Element duty once boiling, 0–100 % |
+| `Boil_Power` | 85 | Element duty once boiling, 0–100 %, and in MANUAL what it heats at by hand |
 | `Max_Output` | 100 | Element duty while heating up to the boil, and the most a hold's PID uses |
 | `P` | blank: 25.2 per °C / 14 per °F | A hold's PID: % of power per degree below the target |
 | `I` | blank: 0.054 per °C / 0.03 per °F | % of power per degree per second below the target, built up only within 2.8 °C / 5 °F of it |
@@ -361,11 +409,14 @@ fails to load — always `pip install`.
 `test_boilpower.py` in the testbench covers 86 checks, loading this file **by
 path** so a run can never pass against a stale installed copy.
 `test_boilpower_brewday_controls.py` covers keep it at the boil, the pause and
-its warning, the usual boil power and boil at (64 checks), and
+its warning, the usual boil power, boil at and heating by hand (84 checks), and
 `test_boilpower_hold_kept.py` and `test_boilpower_whirlpool.py` the hold.
 `test_boilpower_pid_hold.py` runs the hold's PID on the two modelled kettles,
 heated by the power it commands, and `test_e2e_whirlpool_hold.py` runs a
-whirlpool's hold on a full server. `test_blank_defaults.py` checks that each
+whirlpool's hold on a full server. `test_boilpower_manual.py` runs MANUAL on a
+full server: the level the element heats at by hand as CraftBeerPi starts, as
+AUTO stops, as the boil power is set, at a recipe's start and after a power
+cut, with AUTO as before. `test_blank_defaults.py` checks that each
 value `blank_defaults` gives is what the logic does with that property empty,
 in °C and in °F.
 
@@ -378,3 +429,22 @@ guaranteed by the opening and closing de-energize that every run performs. Both
 were caught by running the plugin on a rig, not by the tests.
 
 Nothing here substitutes for watching the first boil.
+
+## Changelog
+
+* **0.0.3.post13** – In MANUAL the element heats at the boil power: one number for AUTO and by hand. While AUTO isn't running, the element's own level, which Brew Day's BOIL ELEMENT and the Hardware page's switch turn it on at, is kept at `Boil_Power`: as AUTO stops, when the boil power is set, when a recipe's start puts back the usual boil power, and as CraftBeerPi starts. An element on by hand follows a change at once. Before, it heated at a level of its own that nothing on Brew Day showed or set: 70 % on the simulators while the window said 45 %. A new action, **Heat by hand at the boil power** (`heat_by_hand_at_boil_power`), does the same on demand, and tells a page this version from an older one.
+* **0.0.3.post12** – Says what an empty setting is taken as (`blank_defaults`), for CraftBeerPi 4.7.7.post41 or later to show and fill in. No change in behaviour.
+* **0.0.3.post11** – SampleTime and the kettle's target must be numbers, and SampleTime is up to 60 s.
+* **0.0.3.post10** – Comments describe the code. No change in behaviour.
+* **0.0.3.post9** – Comments describe the code. No change in behaviour.
+* **0.0.3.post8** – A hold below the boil is held by a PID.
+* **0.0.3.post7** – The kettle's target is the hold; Keep it at the boil, Pause the heat, the usual boil power and Boil at.
+* **0.0.3.post6** – A hold eases off as it nears its target, instead of a flat `Hold_Power`.
+* **0.0.3.post5** – A step can set and clear the hold quietly, and say why itself.
+* **0.0.3.post4** – A hold far below its target climbs at full power first.
+* **0.0.3.post3** – A restart clears the hold, and says so.
+* **0.0.3.post2** – A hold is kept with the kettle until it is cleared; a Boil step clears it.
+* **0.0.3.post1** – An infinite kettle target is no target, not a boil point never reached.
+* **0.0.3** – Holds a temperature below the boil, for a whirlpool or a hop stand.
+* **0.0.2** – The boil power can be set before the boil starts.
+* **0.0.1** – First version: full power to the boil, then a boil power that can be changed while it boils.

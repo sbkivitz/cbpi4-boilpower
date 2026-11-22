@@ -33,10 +33,25 @@ running logic and never touches update(), so vigour changes without the boil
 being interrupted. The same goes for Keep it at the boil, Pause the heat and
 Boil at: each is an action for the same reason.
 
-Every action declares exactly one parameter, named for the setting it keeps,
-and is a no-op given the value in force. The old dashboard's Set Target Temp
-dialog sends every action a logic declares, each seeded with its value in
-force, every time Set is pressed.
+Out of AUTO the element heats by hand at the boil power too: one number for
+AUTO and by hand. CraftBeerPi keeps two levels for each element: the one it
+runs at now, which AUTO sets, and the brewer's own (manual_power), which a
+logic's commands never change. Switching the element on without a level - Brew
+Day's BOIL ELEMENT, the Hardware page's switch - runs it at the brewer's own.
+So while AUTO isn't running, the element's own level is kept at Boil_Power, set
+as the brewer's (_heat_by_hand_at): as AUTO stops, when the boil power is set,
+when a recipe's start puts back the usual boil power, and once as CraftBeerPi
+starts. An element on by hand follows a change at once. Nothing out of AUTO
+reads the probe, so an element on by hand heats on with a probe that has
+failed: that is how a boil is finished when AUTO can't. The action Heat by hand
+at the boil power does the same on demand; declared from 0.0.3.post13, it is
+how a page tells this BoilPower from an older one.
+
+Every action that keeps a setting declares exactly one parameter, named for
+that setting, and is a no-op given the value in force. The old dashboard's Set
+Target Temp dialog sends every action a logic declares, each seeded with its
+value in force, every time Set is pressed. Heat by hand at the boil power keeps
+none and declares none: at a Set it does what Set boil power has just done.
 
 Timing deliberately matches PIDBoil rather than inventing its own. The loop
 runs on SampleTime and hands the percentage to the actor exactly as PIDBoil
@@ -107,6 +122,46 @@ def _notify_kept(cbpi, title, message, type, action):
     return cbpi.notify(title, message, type, action=action)
 
 
+async def _heat_by_hand_at(cbpi, heater, power):
+    """The level `heater` heats at by hand, set to `power`, and its power at
+    once if it is on. -> True if set. Never raises.
+
+    A command made directly, outside automation(), as a page's is: the actor
+    controller keeps a level set that way as the brewer's (manual_power,
+    cbpi/api/automation.py), and switching the element on without a level runs
+    it at that one. A logic's commands, AUTO's included, never change it.
+    set_power never switches an element on.
+
+    Left alone while a kettle's AUTO drives the element: it isn't heating by
+    hand then, and that logic sets its power.
+    """
+    actors = getattr(cbpi, "actor", None)
+    if heater in (None, "") or actors is None:
+        return False
+    try:
+        for kettle in list(getattr(getattr(cbpi, "kettle", None), "data", None) or []):
+            logic = getattr(kettle, "instance", None)
+            if getattr(kettle, "heater", None) == heater and getattr(logic, "running", False):
+                return False
+        item = actors.find_by_id(heater)
+        if item is None or getattr(item, "instance", None) is None:
+            return False
+        runs_at = (getattr(item, "power", None), getattr(item, "output", None))
+        own = getattr(item, "manual_power", None)
+        await actors.set_power(heater, power)
+        # set_power tells every page when the level the element runs at
+        # changes, and not when only its own level does.
+        if (getattr(item, "manual_power", None) != own
+                and (getattr(item, "power", None), getattr(item, "output", None)) == runs_at):
+            push = getattr(actors, "push_udpate", None)
+            if callable(push):
+                await push()
+        return True
+    except Exception as e:  # noqa: BLE001 - never fail a stop, an action or a start on this
+        logging.warning("BoilPower: could not set the level %s heats at by hand: %s", heater, e)
+        return False
+
+
 
 @parameters([
     Property.Number(
@@ -117,8 +172,9 @@ def _notify_kept(cbpi, title, message, type, action):
                     "or above, means boil; one further below means hold."),
     Property.Number(
         label="Boil_Power", configurable=True, default_value=85,
-        description="Element duty once boiling, 0-100%. Adjustable from the "
-                    "dashboard while the boil runs."),
+        description="Element duty once boiling, 0-100%, and in MANUAL what it "
+                    "heats at by hand. Adjustable from the dashboard while the "
+                    "boil runs."),
     Property.Number(
         label="Max_Output", configurable=True, default_value=100,
         description="Element duty while heating up to the boil, and the most "
@@ -418,6 +474,16 @@ class BoilPower(CBPiKettleLogic):
                 kettle = None
         return getattr(kettle, "name", None) or "Boil kettle"
 
+    def _heater_id(self):
+        """This kettle's element, as the kettle names it now, else as run()
+        found it. None if neither. Never raises: an action can reach a logic
+        that never ran, which has no self.heater."""
+        try:
+            kettle = self.get_kettle(self.id)
+        except Exception:  # noqa: BLE001
+            kettle = None
+        return getattr(kettle, "heater", None) or getattr(self, "heater", None)
+
     def _pid_gains(self):
         """The hold's P, I and D in the server's unit: each the kettle's
         setting, else the default. Never raises.
@@ -703,9 +769,10 @@ class BoilPower(CBPiKettleLogic):
         [Property.Number(
             label="Boil_Power", configurable=True, default_value=85,
             min=0, max=100, step=1, unit="%",
-            description="Element duty while boiling. Takes effect on the next "
-                        "control decision, and can be set before the boil "
-                        "starts.")],
+            description="Element duty while boiling, and in MANUAL what it "
+                        "heats at by hand. Takes effect on the next control "
+                        "decision, or at once on an element on by hand, and "
+                        "can be set before the boil starts.")],
         # Boil power is a configured property, not a command. Refusing to set
         # it while the logic is stopped made it unreachable at the one moment a
         # brewer most naturally reaches for it - before starting the boil - and
@@ -714,7 +781,10 @@ class BoilPower(CBPiKettleLogic):
         allow_stopped=True,
     )
     async def set_boil_power(self, Boil_Power=None, Power=None, **kwargs):
-        """Change boil vigour, running or not.
+        """Change boil vigour, running or not. While AUTO isn't running it is
+        what the element heats at by hand too, at once if it is on
+        (_heat_by_hand_at); while AUTO runs, AUTO uses it from its next
+        control decision.
 
         The parameter is labelled `Boil_Power` to match the property it sets.
         That is a convention rather than a requirement, and it is what lets a
@@ -772,12 +842,42 @@ class BoilPower(CBPiKettleLogic):
         except Exception as e:  # noqa: BLE001 - never fail a control action
             logging.warning("BoilPower: could not persist Boil_Power: %s", e)
 
+        if not getattr(self, "running", False):
+            await _heat_by_hand_at(getattr(self, "cbpi", None), self._heater_id(), requested)
+
         self._tell(
             getattr(getattr(self, "kettle", None), "name", "Boil"),
             "Boil power now {}% (was {}%).".format(
                 self._boil_power_override, previous
             ),
         )
+
+    @action(
+        "Heat by hand at the boil power",
+        [],
+        # It keeps no setting, so it declares none: the old dashboard's Set
+        # Target Temp dialog shows "Runs when you press Set." and runs it at
+        # every Set, with every other action. Allowed while stopped, as the
+        # others are, so that Set doesn't warn on a kettle that is off.
+        allow_stopped=True,
+    )
+    async def heat_by_hand_at_boil_power(self, **kwargs):
+        """Out of AUTO, the element heats by hand at the boil power from now:
+        its own level set to Boil_Power, and its power at once if it is on.
+        AUTO stopping, the boil power being set, a recipe's start and
+        CraftBeerPi starting do the same (_heat_by_hand_at); this is for a
+        level the element was given some other way since - Boil_Power changed
+        in the kettle's form on the Hardware page, or a level set on the
+        element itself. With AUTO running, nothing: AUTO drives the element.
+
+        Declared from 0.0.3.post13, so a page can tell from the logic types
+        that MANUAL heats at the boil power. Quiet, and it never switches the
+        element on: the old dialog runs it at every Set, just after Set boil
+        power has done the same.
+        """
+        if getattr(self, "running", False):
+            return
+        await _heat_by_hand_at(getattr(self, "cbpi", None), self._heater_id(), self._boil_power())
 
     @action(
         "Keep it at the boil",
@@ -1022,6 +1122,10 @@ class BoilPower(CBPiKettleLogic):
         # MANUAL and ALL OFF end a pause: there is no AUTO left to carry on.
         # After the element, which is what stopping is for.
         await self._end_pause()
+        # Out of AUTO the element heats by hand at the boil power, the number
+        # the brew-day screen shows. After the element and the pause.
+        if heater is not None:
+            await _heat_by_hand_at(getattr(self, "cbpi", None), heater, self._boil_power())
 
     async def run(self):
         try:
@@ -1530,6 +1634,31 @@ async def _clear_pauses_after_restart(cbpi):
         logging.warning("BoilPower: could not clear pauses after the restart: %s", e)
 
 
+async def _heat_by_hand_after_restart(cbpi):
+    """As CraftBeerPi starts, each BoilPower kettle's element heats by hand at
+    the kettle's boil power. Quiet. Never raises.
+
+    An element comes up at the level kept in actor.json: its own, as last set
+    by a page or a command, which need not be the boil power. Kettles start
+    switched off, so no AUTO is running.
+    """
+    try:
+        for kettle in list(getattr(cbpi.kettle, "data", None) or []):
+            if getattr(kettle, "type", None) != "BoilPower":
+                continue
+            props = getattr(kettle, "props", None)
+            if props is None:
+                continue
+            power = BoilPower._clamp_percent(
+                props.get("Boil_Power", BoilPower.DEFAULT_BOIL_POWER),
+                BoilPower.DEFAULT_BOIL_POWER)
+            if await _heat_by_hand_at(cbpi, getattr(kettle, "heater", None), power):
+                logging.info("BoilPower: %s heats at %s%% by hand, its boil power",
+                             getattr(kettle, "name", None) or "Boil kettle", power)
+    except Exception as e:  # noqa: BLE001
+        logging.warning("BoilPower: could not set the boil power for heating by hand: %s", e)
+
+
 def _usual_power(settings):
     """Usual_Boil_Power in `settings`, a whole percent 0-100, or None: blank,
     or nothing a percentage can be read from. Never raises."""
@@ -1548,9 +1677,12 @@ async def _usual_power_for_the_recipe(cbpi):
 
     Each recipe starts at the usual boil power - at the recipe's start, not
     the boil's, so a power set during the sparge or the "Ready to boil?" hold
-    is kept for that boil. Said only when it changes something.
+    is kept for that boil. Said only when it changes something. Out of AUTO
+    the element heats by hand at it too, at once if it is on
+    (_heat_by_hand_at).
     """
     told = []
+    by_hand = []
     try:
         changed = False
         for kettle in list(getattr(cbpi.kettle, "data", None) or []):
@@ -1577,8 +1709,11 @@ async def _usual_power_for_the_recipe(cbpi):
                     logic_props["Boil_Power"] = usual
             changed = True
             told.append((getattr(kettle, "name", None) or "Boil kettle", usual, was))
+            by_hand.append((getattr(kettle, "heater", None), usual))
         if changed:
             await cbpi.kettle.save()
+        for heater, usual in by_hand:
+            await _heat_by_hand_at(cbpi, heater, usual)
     except Exception as e:  # noqa: BLE001
         logging.warning("BoilPower: could not put the usual boil power back: %s", e)
         return
@@ -1668,6 +1803,7 @@ def setup(cbpi):
         async def after_restart(app):
             await _clear_pauses_after_restart(cbpi)
             _listen_for_recipe_start(cbpi)
+            await _heat_by_hand_after_restart(cbpi)
 
         cbpi.app.on_startup.append(after_restart)
     except Exception as e:  # noqa: BLE001
