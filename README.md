@@ -178,6 +178,10 @@ kept on every page until OK. It is given once a pause, and taken down when the
 heat carries on or AUTO stops. MANUAL, ALL OFF and a restart end a pause.
 Pausing is refused while AUTO is off.
 
+On a simulator, a change of `SIM_TIME_SCALE` sets CraftBeerPi's clock back to
+the computer's time (cbpi4-simvessel 0.0.13). A pause carries on through it,
+counted from the same moment, and AUTO runs on as it was.
+
 ### Usual boil power
 
 `Usual_Boil_Power`, blank by default. When a recipe starts from its first
@@ -432,6 +436,7 @@ Nothing here substitutes for watching the first boil.
 
 ## Changelog
 
+* **0.0.3.post14** – A simulator's change of speed, which sets CraftBeerPi's clock back to the computer's time (CraftBeerPi 4.7.7.post63, cbpi4-simvessel 0.0.13), keeps a pause: it carries on, its start and `Paused_At` moved with the clock, so every page counts it as long as it was and its warning comes when it would have. Without this CraftBeerPi stops and starts AUTO across the change, which ends the pause. Nothing changes on a rig.
 * **0.0.3.post13** – In MANUAL the element heats at the boil power: one number for AUTO and by hand. While AUTO isn't running, the element's own level, which Brew Day's BOIL ELEMENT and the Hardware page's switch turn it on at, is kept at `Boil_Power`: as AUTO stops, when the boil power is set, when a recipe's start puts back the usual boil power, and as CraftBeerPi starts. An element on by hand follows a change at once. Before, it heated at a level of its own that nothing on Brew Day showed or set: 70 % on the simulators while the window said 45 %. A new action, **Heat by hand at the boil power** (`heat_by_hand_at_boil_power`), does the same on demand, and tells a page this version from an older one.
 * **0.0.3.post12** – Says what an empty setting is taken as (`blank_defaults`), for CraftBeerPi 4.7.7.post41 or later to show and fill in. No change in behaviour.
 * **0.0.3.post11** – SampleTime and the kettle's target must be numbers, and SampleTime is up to 60 s.

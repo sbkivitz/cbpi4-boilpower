@@ -1082,6 +1082,28 @@ class BoilPower(CBPiKettleLogic):
         if paused not in (None, "", "No"):
             await self._keep_setting("Paused", "No")
 
+    def clock_moved(self, seconds):
+        """CraftBeerPi's brewing clock has just jumped by `seconds`: a
+        simulator's speed changed, and the clock went back to the computer's
+        time (CraftBeerPi.brewing_clock, cbpi4 4.7.7.post63; never on a rig).
+
+        A pause carries on, counted from the same moment: when it began, and
+        Paused_At, move with the clock, so every page counts it as long as it
+        was, and its warning still comes PAUSE_WARN_AFTER_S into it. Nothing
+        else here keeps the clock's time, so AUTO runs on as it was: told this,
+        CraftBeerPi doesn't stop and start it, which would end the pause.
+        Never raises."""
+        since = getattr(self, "_paused_since", None)
+        if since is None:
+            return
+        try:
+            self._paused_since = since + float(seconds)
+            at = round(self._paused_since, 1)
+            self.props["Paused_At"] = at
+            asyncio.get_running_loop().create_task(self._keep_setting("Paused_At", at))
+        except Exception as e:  # noqa: BLE001
+            logging.warning("BoilPower: could not move the pause with the clock: %s", e)
+
     def _warn_if_pause_forgotten(self):
         """Once a pause, after PAUSE_WARN_AFTER_S: a warning kept on every
         page until OK, or until the pause ends. Never raises."""
